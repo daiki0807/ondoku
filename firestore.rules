@@ -14,9 +14,13 @@ service cloud.firestore {
       allow write: if isGoogleAuth();
     }
 
-    // 児童一覧: 読み取りは認証済みユーザー（匿名含む）、書き込みは管理者のみ
+    // 児童一覧:
+    //   get   = ID指定の1件取得。児童ログインに必要なため全員に許可
+    //   list  = 名簿の一覧取得。外部からの名簿吸い出しを防ぐため管理者のみ
+    //   write = 管理者のみ
     match /students/{studentId} {
-      allow read: if true;
+      allow get: if true;
+      allow list: if isGoogleAuth();
       allow write: if isGoogleAuth();
     }
 
