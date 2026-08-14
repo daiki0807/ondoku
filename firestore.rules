@@ -1,0 +1,44 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // Google認証ユーザー（管理者）かどうか
+    function isGoogleAuth() {
+      return request.auth != null
+        && request.auth.token.firebase.sign_in_provider == 'google.com';
+    }
+
+    // 評価項目設定: 読み取りは全員、書き込みは管理者のみ
+    match /config/{document} {
+      allow read: if true;
+      allow write: if isGoogleAuth();
+    }
+
+    // 児童一覧: 読み取りは認証済みユーザー（匿名含む）、書き込みは管理者のみ
+    match /students/{studentId} {
+      allow read: if true;
+      allow write: if isGoogleAuth();
+    }
+
+    // クラス: 読み取りは全員、書き込みは管理者のみ
+    match /classes/{classId} {
+      allow read: if true;
+      allow write: if isGoogleAuth();
+    }
+
+    // 管理者一覧: 管理者のみ読み書き可
+    match /admins/{email} {
+      allow read, write: if isGoogleAuth();
+    }
+
+    // 児童の記録: 認証済みユーザーが読み書き可。ただし teacherSign は管理者のみ変更可
+    match /users/{userId}/entries/{entryId} {
+      allow read: if request.auth != null;
+      allow create: if request.auth != null
+        && (isGoogleAuth() || request.resource.data.teacherSign == false);
+      allow update: if request.auth != null
+        && (isGoogleAuth() || request.resource.data.teacherSign == resource.data.teacherSign);
+      allow delete: if request.auth != null;
+    }
+  }
+}

@@ -1,5 +1,12 @@
 {
+  "firestore": [
+    {
+      "database": "ondoku-db",
+      "rules": "firestore.rules"
+    }
+  ],
   "hosting": {
+    "site": "ondoku-app-v1",
     "public": "dist",
     "ignore": [
       "firebase.json",
