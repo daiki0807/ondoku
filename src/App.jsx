@@ -7,6 +7,9 @@ import { collection, doc, onSnapshot, setDoc, deleteDoc, updateDoc, getDoc, getD
 import { db, auth, googleProvider } from './firebase';
 import { toJstDateString, getJstHours, addDaysToDateString, getDayOfWeek } from './dateUtils';
 
+// 朝8時の自動「先生確認」を行うクラス名（担任クラスが変わったらここを直す）
+const AUTO_CONFIRM_CLASS_NAMES = ['3年3組'];
+
 export default function App() {
   const [user, setUser] = useState(null);
   const [loading, setLoading] = useState(true);
@@ -277,6 +280,7 @@ export default function App() {
   // 先生がアプリを開いたとき、その日まだ自動確認していなければ、
   // 当日・前日（月曜の場合は金曜まで遡って土日を含む）の未確認提出を
   // 自動で「先生確認済み」にする。1日1回だけ実行（localStorageで制御）。
+  // 対象は AUTO_CONFIRM_CLASS_NAMES のクラスの児童だけ（他の先生のクラスには触れない）。
   const AUTO_CONFIRM_HOUR = 8; // この時刻（日本時間）を過ぎたら自動確認
   const autoConfirmRunningRef = useRef(false);
 
@@ -290,7 +294,14 @@ export default function App() {
   };
 
   useEffect(() => {
-    if (!isAdmin || studentsList.length === 0) return;
+    if (!isAdmin || studentsList.length === 0 || classesList.length === 0) return;
+
+    const targetClassIds = classesList
+      .filter(c => AUTO_CONFIRM_CLASS_NAMES.includes(c.name))
+      .map(c => c.id);
+    // 対象クラスが見つからなければ何もしない（全クラスに広がらないように）
+    if (targetClassIds.length === 0) return;
+    const targetStudents = studentsList.filter(s => targetClassIds.includes(s.classId));
 
     const now = new Date();
     const todayStr = toJstDateString(now);
@@ -307,7 +318,7 @@ export default function App() {
       const { startStr, endStr } = getAutoConfirmRange(now);
       try {
         let confirmedCount = 0;
-        for (const s of studentsList) {
+        for (const s of targetStudents) {
           const snap = await getDocs(collection(db, `users/${s.id}/entries`));
           const targets = snap.docs.filter(d => {
             const e = d.data();
@@ -333,7 +344,7 @@ export default function App() {
     };
 
     runAutoConfirm();
-  }, [isAdmin, studentsList]);
+  }, [isAdmin, studentsList, classesList]);
 
   // --- Fetch Preview Student Entries ---
   useEffect(() => {
