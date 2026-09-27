@@ -2,16 +2,28 @@ rules_version = '2';
 service cloud.firestore {
   match /databases/{database}/documents {
 
-    // Google認証ユーザー（管理者）かどうか
-    function isGoogleAuth() {
+    // マスター管理者（アプリ側 App.jsx の判定と同じメールアドレス）
+    function isMaster() {
       return request.auth != null
-        && request.auth.token.firebase.sign_in_provider == 'google.com';
+        && request.auth.token.firebase.sign_in_provider == 'google.com'
+        && request.auth.token.email_verified == true
+        && request.auth.token.email == 'd.a0807derude@gmail.com';
+    }
+
+    // 管理者 = マスター、または admins コレクションに登録されたGoogleアカウント。
+    // 「Googleでログインしているだけ」では管理者扱いにしない。
+    function isAdmin() {
+      return isMaster()
+        || (request.auth != null
+          && request.auth.token.firebase.sign_in_provider == 'google.com'
+          && request.auth.token.email_verified == true
+          && exists(/databases/$(database)/documents/admins/$(request.auth.token.email)));
     }
 
     // 評価項目設定: 読み取りは全員、書き込みは管理者のみ
     match /config/{document} {
       allow read: if true;
-      allow write: if isGoogleAuth();
+      allow write: if isAdmin();
     }
 
     // 児童一覧:
@@ -20,29 +32,37 @@ service cloud.firestore {
     //   write = 管理者のみ
     match /students/{studentId} {
       allow get: if true;
-      allow list: if isGoogleAuth();
-      allow write: if isGoogleAuth();
+      allow list: if isAdmin();
+      allow write: if isAdmin();
     }
 
     // クラス: 読み取りは全員、書き込みは管理者のみ
     match /classes/{classId} {
       allow read: if true;
-      allow write: if isGoogleAuth();
+      allow write: if isAdmin();
     }
 
-    // 管理者一覧: 管理者のみ読み書き可
+    // 管理者一覧:
+    //   自分のメールの1件だけは、ログイン時の管理者判定のために本人が読める
+    //   追加・削除はマスターのみ
     match /admins/{email} {
-      allow read, write: if isGoogleAuth();
+      allow get: if isAdmin()
+        || (request.auth != null && request.auth.token.email == email);
+      allow list: if isAdmin();
+      allow write: if isMaster();
     }
 
-    // 児童の記録: 認証済みユーザーが読み書き可。ただし teacherSign は管理者のみ変更可
+    // 児童の記録: 認証済みユーザーが読み書き可。ただし
+    //   - teacherSign は管理者のみ変更可
+    //   - 先生確認済みの記録は、管理者以外は削除できない（誤操作による消失防止）
     match /users/{userId}/entries/{entryId} {
       allow read: if request.auth != null;
       allow create: if request.auth != null
-        && (isGoogleAuth() || request.resource.data.teacherSign == false);
+        && (isAdmin() || request.resource.data.teacherSign == false);
       allow update: if request.auth != null
-        && (isGoogleAuth() || request.resource.data.teacherSign == resource.data.teacherSign);
-      allow delete: if request.auth != null;
+        && (isAdmin() || request.resource.data.teacherSign == resource.data.teacherSign);
+      allow delete: if isAdmin()
+        || (request.auth != null && resource.data.teacherSign != true);
     }
   }
 }

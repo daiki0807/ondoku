@@ -1,10 +1,11 @@
 import React, { useState, useEffect, useRef } from 'react';
-import { Plus, Trash2, CheckCircle, PenTool, Save, RotateCcw, Settings, X, Edit2, LogOut, Users, UserPlus, ChevronLeft, Eye } from 'lucide-react';
+import { Plus, Trash2, CheckCircle, PenTool, Save, Settings, X, Edit2, LogOut, Users, UserPlus, ChevronLeft, Eye } from 'lucide-react';
 import { signInAnonymously, signOut, onAuthStateChanged, signInWithPopup } from "firebase/auth";
 import { collection, doc, onSnapshot, setDoc, deleteDoc, updateDoc, getDoc, getDocs, serverTimestamp } from "firebase/firestore";
 
 // Firebase Config
 import { db, auth, googleProvider } from './firebase';
+import { toJstDateString, getJstHours, addDaysToDateString, getDayOfWeek } from './dateUtils';
 
 export default function App() {
   const [user, setUser] = useState(null);
@@ -44,8 +45,8 @@ export default function App() {
 
   // Class Detail View states
   const [viewingClass, setViewingClass] = useState(null); // { id, name }
-  const [viewDate, setViewDate] = useState(new Date().toISOString().split('T')[0]);
-  const [viewDateEnd, setViewDateEnd] = useState(new Date().toISOString().split('T')[0]);
+  const [viewDate, setViewDate] = useState(toJstDateString());
+  const [viewDateEnd, setViewDateEnd] = useState(toJstDateString());
   const [classEntries, setClassEntries] = useState({}); // { studentId: { studentName, entries: [...] } }
 
   // Preview states
@@ -100,8 +101,13 @@ export default function App() {
           setIsAdmin(true);
           setIsMaster(true);
         } else {
-          const adminDoc = await getDoc(doc(db, 'admins', currentUser.email));
-          if (adminDoc.exists()) {
+          let adminDoc = null;
+          try {
+            adminDoc = await getDoc(doc(db, 'admins', currentUser.email));
+          } catch (e) {
+            console.error("Admin check failed:", e);
+          }
+          if (adminDoc?.exists()) {
             setIsAdmin(true);
             setIsMaster(false);
           } else {
@@ -271,28 +277,26 @@ export default function App() {
   // 先生がアプリを開いたとき、その日まだ自動確認していなければ、
   // 当日・前日（月曜の場合は金曜まで遡って土日を含む）の未確認提出を
   // 自動で「先生確認済み」にする。1日1回だけ実行（localStorageで制御）。
-  const AUTO_CONFIRM_HOUR = 8; // この時刻（ローカル時間）を過ぎたら自動確認
+  const AUTO_CONFIRM_HOUR = 8; // この時刻（日本時間）を過ぎたら自動確認
   const autoConfirmRunningRef = useRef(false);
 
-  // 自動確認の対象期間を計算（既存の date フィールドと同じ UTC 日付基準）
+  // 自動確認の対象期間を計算（日本時間の日付基準）
   const getAutoConfirmRange = (now = new Date()) => {
-    const todayStr = now.toISOString().split('T')[0];
-    const base = new Date(todayStr + 'T00:00:00Z');
-    const day = base.getUTCDay(); // 0:日 1:月 ... 6:土
-    const start = new Date(base);
+    const todayStr = toJstDateString(now);
+    const day = getDayOfWeek(todayStr); // 0:日 1:月 ... 6:土
     // 月曜は土日を挟むので金曜まで遡る（金・土・日・月）。それ以外は前日のみ。
-    start.setUTCDate(base.getUTCDate() - (day === 1 ? 3 : 1));
-    return { startStr: start.toISOString().split('T')[0], endStr: todayStr };
+    const startStr = addDaysToDateString(todayStr, day === 1 ? -3 : -1);
+    return { startStr, endStr: todayStr };
   };
 
   useEffect(() => {
     if (!isAdmin || studentsList.length === 0) return;
 
     const now = new Date();
-    const todayStr = now.toISOString().split('T')[0];
+    const todayStr = toJstDateString(now);
 
-    // まだ朝8時を過ぎていない場合は実行しない
-    if (now.getHours() < AUTO_CONFIRM_HOUR) return;
+    // まだ朝8時（日本時間）を過ぎていない場合は実行しない
+    if (getJstHours(now) < AUTO_CONFIRM_HOUR) return;
     // その日すでに自動確認済みなら実行しない
     if (localStorage.getItem('lastAutoConfirmDate') === todayStr) return;
     // 二重実行ガード
@@ -691,7 +695,7 @@ export default function App() {
   // --- Student Data Handlers ---
   const addEntry = async () => {
     if (!student) return;
-    const today = new Date().toISOString().split('T')[0];
+    const today = toJstDateString();
 
     // 同じ日付の記録がすでにある場合は拒否（1日1回まで）
     if (entries.some(e => e.date === today)) {
@@ -725,13 +729,16 @@ export default function App() {
     }
   };
 
-  const deleteEntry = async (id) => {
+  const deleteEntry = async (entry) => {
     if (!student) return;
+    // 先生確認済みの記録は消せない（Firestoreルール側でも禁止している）
+    if (entry.teacherSign) return;
     if (confirm('この行を削除してもよろしいですか？')) {
       try {
-        await deleteDoc(doc(db, `users/${student.id}/entries`, id));
+        await deleteDoc(doc(db, `users/${student.id}/entries`, entry.id));
       } catch (e) {
         console.error("Error deleting document: ", e);
+        alert("削除できませんでした。");
       }
     }
   };
@@ -763,20 +770,6 @@ export default function App() {
       await updateDoc(entryRef, { [field]: !currentValue });
     } catch (e) {
       console.error("Error updating sign: ", e);
-    }
-  };
-
-  const resetData = async () => {
-    if (!student) return;
-    if (confirm('全てのデータをリセットしますか？この操作は取り消せません。')) {
-      try {
-        await Promise.all(
-          entries.map(entry => deleteDoc(doc(db, `users/${student.id}/entries`, entry.id)))
-        );
-      } catch (e) {
-        console.error("Error resetting data:", e);
-        alert("リセットに失敗しました。");
-      }
     }
   };
 
@@ -956,7 +949,7 @@ export default function App() {
                   />
                   <button
                     onClick={() => {
-                      const today = new Date().toISOString().split('T')[0];
+                      const today = toJstDateString();
                       setViewDate(today);
                       setViewDateEnd(today);
                     }}
@@ -967,11 +960,9 @@ export default function App() {
                   <button
                     onClick={() => {
                       // 過去の土日を含む直近7日間
-                      const today = new Date();
-                      const start = new Date(today);
-                      start.setDate(today.getDate() - 6);
-                      setViewDate(start.toISOString().split('T')[0]);
-                      setViewDateEnd(today.toISOString().split('T')[0]);
+                      const today = toJstDateString();
+                      setViewDate(addDaysToDateString(today, -6));
+                      setViewDateEnd(today);
                     }}
                     className="text-xs bg-slate-100 text-slate-600 px-3 py-2 rounded-lg hover:bg-slate-200 transition-colors font-medium"
                   >
@@ -1643,13 +1634,6 @@ export default function App() {
               <Plus className="w-4 h-4" />
               記録を追加
             </button>
-            <button
-              onClick={resetData}
-              className="bg-blue-700 hover:bg-blue-800 text-white px-3 py-2 rounded-lg text-sm flex items-center gap-1 transition-colors"
-              title="データをリセット"
-            >
-              <RotateCcw className="w-4 h-4" />
-            </button>
             <div className="h-6 w-px bg-blue-400 mx-1"></div>
             <button
               onClick={handleLogout}
@@ -1747,12 +1731,14 @@ export default function App() {
                       />
                     </td>
                     <td className="p-3 text-center">
-                      <button
-                        onClick={() => deleteEntry(entry.id)}
-                        className="text-slate-300 hover:text-red-500 p-2 rounded-full hover:bg-red-50 transition-all"
-                      >
-                        <Trash2 className="w-4 h-4" />
-                      </button>
+                      {!entry.teacherSign && (
+                        <button
+                          onClick={() => deleteEntry(entry)}
+                          className="text-slate-300 hover:text-red-500 p-2 rounded-full hover:bg-red-50 transition-all"
+                        >
+                          <Trash2 className="w-4 h-4" />
+                        </button>
+                      )}
                     </td>
                   </tr>
                 ))
