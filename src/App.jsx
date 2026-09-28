@@ -4,14 +4,29 @@ import { signInAnonymously, signOut, onAuthStateChanged, signInWithPopup } from 
 import { collection, doc, onSnapshot, setDoc, deleteDoc, updateDoc, getDoc, getDocs, serverTimestamp } from "firebase/firestore";
 
 // Firebase Config
-import { db, auth, googleProvider } from './firebase';
+import { db, auth, googleProvider, functions } from './firebase';
+import { httpsCallable } from 'firebase/functions';
 import { toJstDateString, getJstHours, addDaysToDateString, getDayOfWeek } from './dateUtils';
+
+// 児童ログイン: 匿名ログイン → 6桁IDを Cloud Functions で確認 → 「その児童本人」の鍵
+// （studentId クレーム）付きのトークンに更新 → 児童データを返す。
+// 鍵がすでに付いている端末では Cloud Functions を呼ばない。児童が存在しなければ null。
+const studentLoginCallable = httpsCallable(functions, 'ondokuStudentLogin');
+const activateStudentSession = async (studentId) => {
+  if (!auth.currentUser) await signInAnonymously(auth);
+  const tokenResult = await auth.currentUser.getIdTokenResult();
+  if (tokenResult.claims.studentId !== studentId) {
+    await studentLoginCallable({ studentId });
+    await auth.currentUser.getIdToken(true);
+  }
+  const snap = await getDoc(doc(db, 'students', studentId));
+  return snap.exists() ? snap.data() : null;
+};
 
 // 朝8時の自動「先生確認」を行うクラス名（担任クラスが変わったらここを直す）
 const AUTO_CONFIRM_CLASS_NAMES = ['3年3組'];
 
 export default function App() {
-  const [user, setUser] = useState(null);
   const [loading, setLoading] = useState(true);
   
   // Login states
@@ -66,36 +81,34 @@ export default function App() {
   const [entries, setEntries] = useState([]);
   const [isSettingsOpen, setIsSettingsOpen] = useState(false);
 
+  // 児童ログインの処理中は true。処理中の匿名サインインで onAuthStateChanged が
+  // もう一度呼ばれても、同じ処理を二重に走らせないためのガード。
+  const studentSessionBusyRef = useRef(false);
+
   // --- Initial Auth & Local Storage Check ---
   useEffect(() => {
-    const checkLocalStudent = async (currentUser) => {
+    const checkLocalStudent = async () => {
+      if (studentSessionBusyRef.current) return;
       const savedId = localStorage.getItem('studentId');
       if (savedId) {
+        studentSessionBusyRef.current = true;
         try {
-          const docRef = doc(db, 'students', savedId);
-          const snap = await getDoc(docRef);
-          if (snap.exists()) {
-            setStudent({ id: savedId, ...snap.data() });
-            // entries の読み書きには Firebase Auth が必要なので匿名サインイン
-            if (!currentUser) {
-              try {
-                await signInAnonymously(auth);
-              } catch (e) {
-                console.error("Anonymous sign-in failed:", e);
-              }
-            }
+          const data = await activateStudentSession(savedId);
+          if (data) {
+            setStudent({ id: savedId, ...data });
           } else {
             localStorage.removeItem('studentId');
           }
         } catch (e) {
-          console.error("Error fetching local student:", e);
+          if (e.code === 'functions/not-found') localStorage.removeItem('studentId');
+          console.error("Error restoring student session:", e);
         }
+        studentSessionBusyRef.current = false;
       }
       setLoading(false);
     };
 
     const unsubscribe = onAuthStateChanged(auth, async (currentUser) => {
-      setUser(currentUser);
       
       if (currentUser && currentUser.email) {
         // Logged in with Google -> Admin Check
@@ -128,7 +141,7 @@ export default function App() {
       }
 
       if (!currentUser || !currentUser.email) {
-        checkLocalStudent(currentUser);
+        checkLocalStudent();
       } else {
         setLoading(false);
       }
@@ -398,23 +411,27 @@ export default function App() {
       alert("6桁のIDを入力してください。");
       return;
     }
+    studentSessionBusyRef.current = true;
     setLoading(true);
     try {
-      const snap = await getDoc(doc(db, 'students', studentIdInput));
-      if (snap.exists()) {
-        const data = snap.data();
+      const data = await activateStudentSession(studentIdInput);
+      if (data) {
         setStudent({ id: studentIdInput, ...data });
         localStorage.setItem('studentId', studentIdInput);
-        if (!user) {
-          await signInAnonymously(auth);
-        }
       } else {
         alert("該当するIDが見つかりません。先生に確認してください。");
       }
     } catch (error) {
       console.error(error);
-      alert("ログインに失敗しました。");
+      if (error.code === 'functions/not-found') {
+        alert("該当するIDが見つかりません。先生に確認してください。");
+      } else if (error.code === 'functions/resource-exhausted') {
+        alert("まちがいが多かったので、10分くらい待ってからもう一度ためしてね。");
+      } else {
+        alert("ログインに失敗しました。");
+      }
     }
+    studentSessionBusyRef.current = false;
     setLoading(false);
   };
 
@@ -800,7 +817,8 @@ export default function App() {
   }
 
   // --- ログインしていない場合 ---
-  if (!user && !student && !isAdmin) {
+  // 匿名ログインだけ済んで児童が決まっていない状態もログイン画面を出す
+  if (!student && !isAdmin) {
     return (
       <div className="min-h-screen bg-slate-100 flex items-center justify-center p-4 font-sans">
         <div className="bg-white p-8 rounded-xl shadow-lg max-w-md w-full relative">
