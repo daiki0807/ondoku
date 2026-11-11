@@ -40,6 +40,32 @@ const formatLoginCode = (code) => (code ? `${code.slice(0, 4)}-${code.slice(4)}`
 // 朝8時の自動「先生確認」を行うクラス名（担任クラスが変わったらここを直す）
 const AUTO_CONFIRM_CLASS_NAMES = ['3年3組'];
 
+// 評価項目の初期値。Firestore に config/columns がまだないときは、これを表示に使う
+// （ドキュメントは管理者が「項目設定」で保存したときに作られる）。
+const INITIAL_COLUMNS = [
+  { id: 'eval1', title: '点・丸', subtitle: '気をつける', type: 'select' },
+  { id: 'eval2', title: '気持ち', subtitle: 'こめる', type: 'select' },
+  { id: 'eval3', title: '九九', subtitle: 'カード', type: 'select' },
+];
+
+// 管理者のメールアドレスは小文字にそろえて admins/{email} のIDにする
+const normalizeEmail = (email) => (email || '').trim().toLowerCase();
+
+// 数字タイプの範囲（初期値 1〜5）。保存値が空・NaN・文字列でも数値で返す
+const NUMBER_RANGE_DEFAULT = { min: 1, max: 5 };
+const NUMBER_RANGE_MAX_COUNT = 100; // 選択肢の数の上限
+const toIntOrNull = (v) => {
+  if (v === '' || v === null || v === undefined) return null;
+  const n = Number(v);
+  return Number.isInteger(n) ? n : null;
+};
+const getNumberRange = (options) => {
+  const min = toIntOrNull(options?.min) ?? NUMBER_RANGE_DEFAULT.min;
+  const max = toIntOrNull(options?.max) ?? NUMBER_RANGE_DEFAULT.max;
+  // 古いデータで min > max になっていても画面が落ちないようにする
+  return min <= max ? { min, max } : { min: max, max: min };
+};
+
 export default function App() {
   const [loading, setLoading] = useState(true);
   
@@ -87,12 +113,7 @@ export default function App() {
   const [previewEntries, setPreviewEntries] = useState([]);
 
   // Data states
-  const initialColumns = [
-    { id: 'eval1', title: '点・丸', subtitle: '気をつける', type: 'select' },
-    { id: 'eval2', title: '気持ち', subtitle: 'こめる', type: 'select' },
-    { id: 'eval3', title: '九九', subtitle: 'カード', type: 'select' },
-  ];
-  const [columns, setColumns] = useState(initialColumns);
+  const [columns, setColumns] = useState(INITIAL_COLUMNS);
   const [entries, setEntries] = useState([]);
   const [isSettingsOpen, setIsSettingsOpen] = useState(false);
 
@@ -134,7 +155,7 @@ export default function App() {
         } else {
           let adminDoc = null;
           try {
-            adminDoc = await getDoc(doc(db, 'admins', currentUser.email));
+            adminDoc = await getDoc(doc(db, 'admins', normalizeEmail(currentUser.email)));
           } catch (e) {
             console.error("Admin check failed:", e);
           }
@@ -521,15 +542,15 @@ export default function App() {
   // --- Fetch Global Columns ---
   useEffect(() => {
     const columnsRef = doc(db, 'config', 'columns');
+    // ドキュメントがなくてもここでは作らない（児童には config の書き込み権限がなく、
+    // 書き込み失敗 → スナップショット再通知 → また書き込み…の繰り返しになるため）。
     const unsubscribeColumns = onSnapshot(columnsRef, (docSnap) => {
-      if (docSnap.exists()) {
-        setColumns(docSnap.data().data);
-      } else {
-        setDoc(columnsRef, { data: initialColumns });
-      }
+      const data = docSnap.exists() ? docSnap.data().data : null;
+      setColumns(Array.isArray(data) && data.length > 0 ? data : INITIAL_COLUMNS);
+    }, (error) => {
+      console.error("Error fetching columns:", error);
     });
     return () => unsubscribeColumns();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   // --- Fetch Student Data ---
@@ -857,17 +878,18 @@ export default function App() {
 
   const handleAddAdmin = async (e) => {
     e.preventDefault();
-    if (!newAdminEmail.trim() || !newAdminEmail.includes('@')) {
+    const email = normalizeEmail(newAdminEmail);
+    if (!email || !email.includes('@')) {
       alert("有効なメールアドレスを入力してください。");
       return;
     }
     try {
-      await setDoc(doc(db, 'admins', newAdminEmail.trim()), {
+      await setDoc(doc(db, 'admins', email), {
         addedAt: serverTimestamp(),
         addedBy: adminUser.email
       });
       setNewAdminEmail('');
-      alert(`管理者として追加しました: ${newAdminEmail}`);
+      alert(`管理者として追加しました: ${email}`);
     } catch (error) {
       console.error("Add admin failed", error);
       alert("追加に失敗しました。");
@@ -906,7 +928,7 @@ export default function App() {
 
     columns.forEach(col => {
       if (col.type === 'number') {
-        newEntry[col.id] = col.options?.min || 1;
+        newEntry[col.id] = getNumberRange(col.options).min;
       } else if (col.type === 'text') {
         newEntry[col.id] = '';
       } else {
@@ -939,8 +961,10 @@ export default function App() {
   const updateEntry = async (id, field, value) => {
     if (!student) return;
 
-    // 日付変更時、別の記録と日付が重複しないかチェック
     if (field === 'date') {
+      // 日付が空の記録は先生のクラス画面（期間で絞り込み）に出てこなくなるので保存しない
+      if (!/^\d{4}-\d{2}-\d{2}$/.test(value || '')) return;
+      // 別の記録と日付が重複しないかチェック
       const duplicate = entries.some(e => e.id !== id && e.date === value);
       if (duplicate) {
         alert('その日付の記録はすでにあります。同じ日に複数の記録は登録できません。');
@@ -1979,6 +2003,7 @@ export default function App() {
                       <input
                         type="date"
                         value={entry.date}
+                        required
                         onChange={(e) => updateEntry(entry.id, 'date', e.target.value)}
                         className="w-full p-2 border border-slate-200 rounded-md focus:outline-none focus:ring-2 focus:ring-blue-400 text-sm"
                       />
@@ -2143,14 +2168,14 @@ const DynamicInput = ({ type, options, value, onChange }) => {
   const safeValue = value ?? '';
 
   if (type === 'number') {
-    const min = Number(options?.min) || 1;
-    const max = Number(options?.max) || 5;
-    const range = Array.from({ length: max - min + 1 }, (_, i) => min + i);
+    const { min, max } = getNumberRange(options);
+    const count = Math.min(max - min + 1, NUMBER_RANGE_MAX_COUNT);
+    const range = Array.from({ length: count }, (_, i) => min + i);
 
     return (
       <select
         value={safeValue}
-        onChange={(e) => onChange(e.target.value)}
+        onChange={(e) => onChange(Number(e.target.value))}
         className="w-full p-2 border rounded-md focus:outline-none focus:ring-2 focus:ring-blue-400 text-center text-lg appearance-none cursor-pointer bg-white text-slate-700"
       >
         {range.map(num => (
@@ -2214,9 +2239,34 @@ const SettingsModal = ({ columns, onClose, onSave }) => {
   };
 
   const handleSave = async () => {
+    // 数字タイプの範囲を整数にそろえる（入力欄が空のままだと NaN が保存されていた）
+    const normalized = [];
+    for (const col of localColumns) {
+      if (col.type !== 'number') {
+        normalized.push(col);
+        continue;
+      }
+      const min = toIntOrNull(col.options?.min);
+      const max = toIntOrNull(col.options?.max);
+      const name = col.title || '数字の項目';
+      if (min === null || max === null) {
+        alert(`「${name}」の範囲に整数を入れてください。`);
+        return;
+      }
+      if (min > max) {
+        alert(`「${name}」の範囲は、左の数を右の数以下にしてください。`);
+        return;
+      }
+      if (max - min + 1 > NUMBER_RANGE_MAX_COUNT) {
+        alert(`「${name}」の範囲は${NUMBER_RANGE_MAX_COUNT}個以内にしてください。`);
+        return;
+      }
+      normalized.push({ ...col, options: { ...col.options, min, max } });
+    }
+
     setSaving(true);
     try {
-      await onSave(localColumns);
+      await onSave(normalized);
       onClose();
     } catch {
       setSaving(false);
@@ -2308,15 +2358,15 @@ const SettingsModal = ({ columns, onClose, onSave }) => {
                         <span className="text-xs text-slate-500">範囲:</span>
                         <input
                           type="number"
-                          value={col.options?.min || 1}
-                          onChange={(e) => handleUpdate(col.id, 'options.min', parseInt(e.target.value))}
+                          value={col.options?.min ?? NUMBER_RANGE_DEFAULT.min}
+                          onChange={(e) => handleUpdate(col.id, 'options.min', e.target.value)}
                           className="w-16 p-1 text-sm border rounded text-center"
                         />
                         <span className="text-slate-400">〜</span>
                         <input
                           type="number"
-                          value={col.options?.max || 5}
-                          onChange={(e) => handleUpdate(col.id, 'options.max', parseInt(e.target.value))}
+                          value={col.options?.max ?? NUMBER_RANGE_DEFAULT.max}
+                          onChange={(e) => handleUpdate(col.id, 'options.max', e.target.value)}
                           className="w-16 p-1 text-sm border rounded text-center"
                         />
                       </div>

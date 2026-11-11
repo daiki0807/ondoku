@@ -12,12 +12,13 @@ service cloud.firestore {
 
     // 管理者 = マスター、または admins コレクションに登録されたGoogleアカウント。
     // 「Googleでログインしているだけ」では管理者扱いにしない。
+    // admins のドキュメントIDは小文字のメールアドレス（App.jsx の normalizeEmail と同じ）。
     function isAdmin() {
       return isMaster()
         || (request.auth != null
           && request.auth.token.firebase.sign_in_provider == 'google.com'
           && request.auth.token.email_verified == true
-          && exists(/databases/$(database)/documents/admins/$(request.auth.token.email)));
+          && exists(/databases/$(database)/documents/admins/$(request.auth.token.email.lower())));
     }
 
     // その児童本人としてログインしている端末か。
@@ -55,7 +56,7 @@ service cloud.firestore {
     //   追加・削除はマスターのみ
     match /admins/{email} {
       allow get: if isAdmin()
-        || (request.auth != null && request.auth.token.email == email);
+        || (request.auth != null && request.auth.token.email.lower() == email);
       allow list: if isAdmin();
       allow write: if isMaster();
     }
