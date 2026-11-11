@@ -1,7 +1,7 @@
 import React, { useState, useEffect, useRef } from 'react';
 import { Plus, Trash2, CheckCircle, PenTool, Save, Settings, X, Edit2, LogOut, Users, UserPlus, ChevronLeft, Eye } from 'lucide-react';
 import { signInAnonymously, signOut, onAuthStateChanged, signInWithPopup } from "firebase/auth";
-import { collection, doc, onSnapshot, setDoc, deleteDoc, updateDoc, getDoc, getDocs, serverTimestamp } from "firebase/firestore";
+import { collection, doc, onSnapshot, setDoc, deleteDoc, updateDoc, getDoc, getDocs, serverTimestamp, writeBatch } from "firebase/firestore";
 
 // Firebase Config
 import { db, auth, googleProvider, functions } from './firebase';
@@ -65,7 +65,8 @@ export default function App() {
   const [viewingClass, setViewingClass] = useState(null); // { id, name }
   const [viewDate, setViewDate] = useState(toJstDateString());
   const [viewDateEnd, setViewDateEnd] = useState(toJstDateString());
-  const [classEntries, setClassEntries] = useState({}); // { studentId: { studentName, entries: [...] } }
+  const [classEntries, setClassEntries] = useState({}); // { studentId: { studentName, entries: [...], unconfirmed: [{ id, date }] } }
+  const [isConfirmingAllPast, setIsConfirmingAllPast] = useState(false);
 
   // Preview states
   const [previewStudent, setPreviewStudent] = useState(null); // { id, name }
@@ -226,7 +227,7 @@ export default function App() {
     const initialEntriesMap = {};
 
     classStudents.forEach(s => {
-      initialEntriesMap[s.id] = { studentName: s.name, entries: [] };
+      initialEntriesMap[s.id] = { studentName: s.name, entries: [], unconfirmed: [] };
 
       const entriesRef = collection(db, `users/${s.id}/entries`);
       const unsub = onSnapshot(entriesRef, (snapshot) => {
@@ -234,9 +235,13 @@ export default function App() {
         const matched = allEntries
           .filter(e => e.date && e.date >= startDate && e.date <= endDate)
           .sort((a, b) => a.date.localeCompare(b.date));
+        // 期間に関係なく、未確認の記録（日付つき）をすべて控えておく。「過去の未確認をすべて確認」で使う
+        const unconfirmed = allEntries
+          .filter(e => e.date && !e.teacherSign)
+          .map(e => ({ id: e.id, date: e.date }));
         setClassEntries(prev => ({
           ...prev,
-          [s.id]: { studentName: s.name, entries: matched }
+          [s.id]: { studentName: s.name, entries: matched, unconfirmed }
         }));
       });
       unsubscribers.push(unsub);
@@ -287,6 +292,49 @@ export default function App() {
       console.error("Bulk teacher sign failed", e);
       alert('一括確認に失敗しました。');
     }
+  };
+
+  // --- 過去の未確認をすべて「先生確認」にする（期間の選択に関係なく、今日までの分）---
+  // 未来の日付になっている記録は対象外（児童が日付を書きかえた可能性があるため）。
+  const getPastUnconfirmed = (classStudents, todayStr = toJstDateString()) => {
+    const targets = [];
+    classStudents.forEach(s => {
+      (classEntries[s.id]?.unconfirmed || []).forEach(e => {
+        if (e.date <= todayStr) targets.push({ studentId: s.id, entryId: e.id, date: e.date });
+      });
+    });
+    return targets;
+  };
+
+  const handleConfirmAllPast = async () => {
+    if (!viewingClass || isConfirmingAllPast) return;
+    const classStudents = studentsList.filter(s => s.classId === viewingClass.id);
+    const todayStr = toJstDateString();
+    const targets = getPastUnconfirmed(classStudents, todayStr);
+    if (targets.length === 0) {
+      alert('未確認の記録はありません。');
+      return;
+    }
+    const oldest = targets.reduce((min, t) => (t.date < min ? t.date : min), todayStr);
+    const studentCount = new Set(targets.map(t => t.studentId)).size;
+    if (!confirm(`${viewingClass.name} の ${oldest}〜${todayStr} の未確認 ${targets.length} 件（${studentCount}名分）を、すべて「先生確認」にしますか？\n\n※確認済みにした記録は、児童が削除できなくなります。`)) return;
+
+    setIsConfirmingAllPast(true);
+    try {
+      // 1回のまとめ書き込みは500件までなので、区切って送る
+      for (let i = 0; i < targets.length; i += 400) {
+        const batch = writeBatch(db);
+        targets.slice(i, i + 400).forEach(t => {
+          batch.update(doc(db, `users/${t.studentId}/entries`, t.entryId), { teacherSign: true });
+        });
+        await batch.commit();
+      }
+      alert(`${targets.length} 件を「先生確認」にしました。`);
+    } catch (e) {
+      console.error("Confirm all past failed", e);
+      alert('一括確認に失敗しました。途中まで確認済みになっている可能性があります。もう一度押すと残りを確認します。');
+    }
+    setIsConfirmingAllPast(false);
   };
 
   // --- 朝8時の自動「先生確認」---------------------------------------------
@@ -913,6 +961,7 @@ export default function App() {
       const confirmedCount = allRangeEntries.filter(r => r.entry.teacherSign).length;
       const parentSignedCount = allRangeEntries.filter(r => r.entry.parentSign).length;
       const unconfirmedSubmittedCount = allRangeEntries.filter(r => !r.entry.teacherSign).length;
+      const pastUnconfirmedCount = getPastUnconfirmed(classStudents).length;
 
       // 表示用の行リストを構築（期間内に提出のある児童は提出ごとに1行、未提出児童は1行のみ）
       const tableRows = [];
@@ -1045,6 +1094,26 @@ export default function App() {
                       {unconfirmedSubmittedCount}
                     </span>
                   )}
+                </button>
+              </div>
+              {/* 過去の未確認をすべて確認（期間の選択に関係なく、今日まで） */}
+              <div className="px-4 py-3 border-b border-slate-100 flex items-center justify-between gap-2">
+                <span className="text-sm text-slate-500">
+                  {pastUnconfirmedCount > 0
+                    ? `今日までの未確認（期間外もふくむ）: ${pastUnconfirmedCount}件`
+                    : '今日までの未確認はありません'}
+                </span>
+                <button
+                  onClick={handleConfirmAllPast}
+                  disabled={pastUnconfirmedCount === 0 || isConfirmingAllPast}
+                  className={`flex items-center gap-2 px-4 py-2 rounded-lg text-sm font-bold transition-all whitespace-nowrap ${
+                    pastUnconfirmedCount > 0 && !isConfirmingAllPast
+                      ? 'bg-white border border-indigo-600 text-indigo-700 hover:bg-indigo-50 active:scale-95'
+                      : 'bg-slate-100 text-slate-400 cursor-not-allowed'
+                  }`}
+                >
+                  <CheckCircle className="w-4 h-4" />
+                  {isConfirmingAllPast ? '確認中...' : '過去の未確認をすべて確認'}
                 </button>
               </div>
               <div className="p-0 overflow-x-auto">
