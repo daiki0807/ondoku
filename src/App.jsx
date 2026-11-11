@@ -1,30 +1,70 @@
 import React, { useState, useEffect, useRef } from 'react';
-import { Plus, Trash2, CheckCircle, PenTool, Save, Settings, X, Edit2, LogOut, Users, UserPlus, ChevronLeft, Eye } from 'lucide-react';
+import { Plus, Trash2, CheckCircle, PenTool, Save, Settings, X, Edit2, LogOut, Users, UserPlus, ChevronLeft, Eye, RefreshCw, KeyRound } from 'lucide-react';
 import { signInAnonymously, signOut, onAuthStateChanged, signInWithPopup } from "firebase/auth";
-import { collection, doc, onSnapshot, setDoc, deleteDoc, updateDoc, getDoc, getDocs, serverTimestamp } from "firebase/firestore";
+import { collection, doc, onSnapshot, setDoc, deleteDoc, updateDoc, getDoc, getDocs, serverTimestamp, writeBatch } from "firebase/firestore";
 
 // Firebase Config
 import { db, auth, googleProvider, functions } from './firebase';
 import { httpsCallable } from 'firebase/functions';
 import { toJstDateString, getJstHours, addDaysToDateString, getDayOfWeek } from './dateUtils';
 
-// 児童ログイン: 匿名ログイン → 6桁IDを Cloud Functions で確認 → 「その児童本人」の鍵
-// （studentId クレーム）付きのトークンに更新 → 児童データを返す。
-// 鍵がすでに付いている端末では Cloud Functions を呼ばない。児童が存在しなければ null。
+// 児童ログイン: 匿名ログイン → 番号を Cloud Functions で確認 → 「その児童本人」の鍵
+// （studentId クレーム）付きのトークンに更新 → 児童データ（id つき）を返す。児童が存在しなければ null。
+//   code           : 入力された番号（8桁のログイン番号。切り替えスイッチがONのあいだは6桁の児童IDも可）
+//   savedStudentId : この端末に覚えている児童ID。鍵がすでに付いていれば Cloud Functions を呼ばない
 const studentLoginCallable = httpsCallable(functions, 'ondokuStudentLogin');
-const activateStudentSession = async (studentId) => {
+const activateStudentSession = async ({ code, savedStudentId }) => {
   if (!auth.currentUser) await signInAnonymously(auth);
   const tokenResult = await auth.currentUser.getIdTokenResult();
-  if (tokenResult.claims.studentId !== studentId) {
-    await studentLoginCallable({ studentId });
+  let studentId = null;
+  if (!code && savedStudentId && tokenResult.claims.studentId === savedStudentId) {
+    studentId = savedStudentId;
+  } else {
+    const sendCode = code ?? savedStudentId;
+    const res = await studentLoginCallable({ code: sendCode });
+    studentId = res.data?.studentId ?? sendCode; // 古い Cloud Functions は studentId を返さない
     await auth.currentUser.getIdToken(true);
   }
   const snap = await getDoc(doc(db, 'students', studentId));
-  return snap.exists() ? snap.data() : null;
+  return snap.exists() ? { id: studentId, ...snap.data() } : null;
 };
+
+// ログイン番号（8桁）を作る。推測されないよう暗号用の乱数を使う
+const generateLoginCode = () => {
+  const buf = new Uint32Array(1);
+  crypto.getRandomValues(buf);
+  return String(10000000 + (buf[0] % 90000000));
+};
+const formatLoginCode = (code) => (code ? `${code.slice(0, 4)}-${code.slice(4)}` : '');
 
 // 朝8時の自動「先生確認」を行うクラス名（担任クラスが変わったらここを直す）
 const AUTO_CONFIRM_CLASS_NAMES = ['3年3組'];
+
+// 評価項目の初期値。Firestore に config/columns がまだないときは、これを表示に使う
+// （ドキュメントは管理者が「項目設定」で保存したときに作られる）。
+const INITIAL_COLUMNS = [
+  { id: 'eval1', title: '点・丸', subtitle: '気をつける', type: 'select' },
+  { id: 'eval2', title: '気持ち', subtitle: 'こめる', type: 'select' },
+  { id: 'eval3', title: '九九', subtitle: 'カード', type: 'select' },
+];
+
+// 管理者のメールアドレスは小文字にそろえて admins/{email} のIDにする
+const normalizeEmail = (email) => (email || '').trim().toLowerCase();
+
+// 数字タイプの範囲（初期値 1〜5）。保存値が空・NaN・文字列でも数値で返す
+const NUMBER_RANGE_DEFAULT = { min: 1, max: 5 };
+const NUMBER_RANGE_MAX_COUNT = 100; // 選択肢の数の上限
+const toIntOrNull = (v) => {
+  if (v === '' || v === null || v === undefined) return null;
+  const n = Number(v);
+  return Number.isInteger(n) ? n : null;
+};
+const getNumberRange = (options) => {
+  const min = toIntOrNull(options?.min) ?? NUMBER_RANGE_DEFAULT.min;
+  const max = toIntOrNull(options?.max) ?? NUMBER_RANGE_DEFAULT.max;
+  // 古いデータで min > max になっていても画面が落ちないようにする
+  return min <= max ? { min, max } : { min: max, max: min };
+};
 
 export default function App() {
   const [loading, setLoading] = useState(true);
@@ -65,19 +105,15 @@ export default function App() {
   const [viewingClass, setViewingClass] = useState(null); // { id, name }
   const [viewDate, setViewDate] = useState(toJstDateString());
   const [viewDateEnd, setViewDateEnd] = useState(toJstDateString());
-  const [classEntries, setClassEntries] = useState({}); // { studentId: { studentName, entries: [...] } }
+  const [classEntries, setClassEntries] = useState({}); // { studentId: { studentName, entries: [...], unconfirmed: [{ id, date }] } }
+  const [isConfirmingAllPast, setIsConfirmingAllPast] = useState(false);
 
   // Preview states
   const [previewStudent, setPreviewStudent] = useState(null); // { id, name }
   const [previewEntries, setPreviewEntries] = useState([]);
 
   // Data states
-  const initialColumns = [
-    { id: 'eval1', title: '点・丸', subtitle: '気をつける', type: 'select' },
-    { id: 'eval2', title: '気持ち', subtitle: 'こめる', type: 'select' },
-    { id: 'eval3', title: '九九', subtitle: 'カード', type: 'select' },
-  ];
-  const [columns, setColumns] = useState(initialColumns);
+  const [columns, setColumns] = useState(INITIAL_COLUMNS);
   const [entries, setEntries] = useState([]);
   const [isSettingsOpen, setIsSettingsOpen] = useState(false);
 
@@ -93,9 +129,9 @@ export default function App() {
       if (savedId) {
         studentSessionBusyRef.current = true;
         try {
-          const data = await activateStudentSession(savedId);
+          const data = await activateStudentSession({ savedStudentId: savedId });
           if (data) {
-            setStudent({ id: savedId, ...data });
+            setStudent(data);
           } else {
             localStorage.removeItem('studentId');
           }
@@ -119,7 +155,7 @@ export default function App() {
         } else {
           let adminDoc = null;
           try {
-            adminDoc = await getDoc(doc(db, 'admins', currentUser.email));
+            adminDoc = await getDoc(doc(db, 'admins', normalizeEmail(currentUser.email)));
           } catch (e) {
             console.error("Admin check failed:", e);
           }
@@ -212,6 +248,90 @@ export default function App() {
     };
   }, [isAdmin, isMaster]);
 
+  // --- 児童ログインの設定（6桁IDでのログインを受け付けるか）---
+  // config/login がないときは受け付ける（Cloud Functions 側と同じ）
+  const [allowLegacyId, setAllowLegacyId] = useState(true);
+  useEffect(() => {
+    if (!isAdmin) return;
+    return onSnapshot(doc(db, 'config', 'login'), (snap) => {
+      setAllowLegacyId(!snap.exists() || snap.data().allowLegacyId !== false);
+    });
+  }, [isAdmin]);
+
+  const handleToggleLegacyId = async () => {
+    const next = !allowLegacyId;
+    const message = next
+      ? '6桁の児童IDでのログインを、もう一度受け付けますか？\n（6桁IDの総当たりに弱い状態にもどります）'
+      : '6桁の児童IDでのログインを止めますか？\n\n・すでにログインしている端末はそのまま使えます。\n・新しくログインするときは、8桁のログイン番号が必要になります。\n・ほかの先生のクラスにも効きます。全員にログイン番号を配り終えてから止めてください。';
+    if (!confirm(message)) return;
+    try {
+      await setDoc(doc(db, 'config', 'login'), { allowLegacyId: next, updatedAt: serverTimestamp(), updatedBy: adminUser.email });
+    } catch (e) {
+      console.error('Toggle legacy login failed', e);
+      alert('設定の変更に失敗しました。');
+    }
+  };
+
+  // ログイン番号を発行する（すでに番号がある児童は新しい番号に取りかえる）。
+  // loginCodes/{番号} は「作成のみ可・上書き不可」のルールなので、番号が重なったら失敗して作り直しになる。
+  const issueLoginCodes = async (targets) => {
+    const used = new Set(studentsList.map(s => s.loginCode).filter(Boolean));
+    const assignments = targets.map(t => {
+      let code;
+      do { code = generateLoginCode(); } while (used.has(code));
+      used.add(code);
+      return { ...t, code };
+    });
+    // 1回のまとめ書き込みは500件まで（1人につき最大3件書く）
+    for (let i = 0; i < assignments.length; i += 150) {
+      const batch = writeBatch(db);
+      assignments.slice(i, i + 150).forEach(({ id, oldCode, code }) => {
+        if (oldCode) batch.delete(doc(db, 'loginCodes', oldCode));
+        batch.set(doc(db, 'loginCodes', code), { studentId: id, createdAt: serverTimestamp() });
+        batch.update(doc(db, 'students', id), { loginCode: code });
+      });
+      await batch.commit();
+    }
+    return assignments;
+  };
+
+  const handleIssueMissingCodes = async (filteredStudents) => {
+    const targets = filteredStudents.filter(s => !s.loginCode);
+    if (targets.length === 0) return;
+    if (!confirm(`ログイン番号がまだない ${targets.length}名 に番号を発行しますか？`)) return;
+    setLoading(true);
+    try {
+      await issueLoginCodes(targets.map(s => ({ id: s.id })));
+      alert(`${targets.length}名 にログイン番号を発行しました。\n「CSVダウンロード」で番号の一覧を出せます。`);
+    } catch (e) {
+      console.error('Issue login codes failed', e);
+      alert('発行に失敗しました。もう一度押すと、まだの児童に発行します。');
+    }
+    setLoading(false);
+  };
+
+  const handleReissueCode = async (s) => {
+    if (!confirm(`${s.name} さんのログイン番号を新しくしますか？\n今の番号（${formatLoginCode(s.loginCode)}）は使えなくなります。\nすでにログインしている端末はそのまま使えます。`)) return;
+    try {
+      const [{ code }] = await issueLoginCodes([{ id: s.id, oldCode: s.loginCode }]);
+      alert(`${s.name} さんの新しいログイン番号: ${formatLoginCode(code)}`);
+    } catch (e) {
+      console.error('Reissue login code failed', e);
+      alert('再発行に失敗しました。');
+    }
+  };
+
+  // 児童を削除するときは、その児童のログイン番号も消す
+  const deleteStudentDocs = async (ids) => {
+    const batch = writeBatch(db);
+    ids.forEach(id => {
+      const code = studentsList.find(s => s.id === id)?.loginCode;
+      if (code) batch.delete(doc(db, 'loginCodes', code));
+      batch.delete(doc(db, 'students', id));
+    });
+    await batch.commit();
+  };
+
   // --- Fetch Class Detail Data ---
   useEffect(() => {
     if (!isAdmin || !viewingClass) return;
@@ -226,7 +346,7 @@ export default function App() {
     const initialEntriesMap = {};
 
     classStudents.forEach(s => {
-      initialEntriesMap[s.id] = { studentName: s.name, entries: [] };
+      initialEntriesMap[s.id] = { studentName: s.name, entries: [], unconfirmed: [] };
 
       const entriesRef = collection(db, `users/${s.id}/entries`);
       const unsub = onSnapshot(entriesRef, (snapshot) => {
@@ -234,9 +354,13 @@ export default function App() {
         const matched = allEntries
           .filter(e => e.date && e.date >= startDate && e.date <= endDate)
           .sort((a, b) => a.date.localeCompare(b.date));
+        // 期間に関係なく、未確認の記録（日付つき）をすべて控えておく。「過去の未確認をすべて確認」で使う
+        const unconfirmed = allEntries
+          .filter(e => e.date && !e.teacherSign)
+          .map(e => ({ id: e.id, date: e.date }));
         setClassEntries(prev => ({
           ...prev,
-          [s.id]: { studentName: s.name, entries: matched }
+          [s.id]: { studentName: s.name, entries: matched, unconfirmed }
         }));
       });
       unsubscribers.push(unsub);
@@ -287,6 +411,49 @@ export default function App() {
       console.error("Bulk teacher sign failed", e);
       alert('一括確認に失敗しました。');
     }
+  };
+
+  // --- 過去の未確認をすべて「先生確認」にする（期間の選択に関係なく、今日までの分）---
+  // 未来の日付になっている記録は対象外（児童が日付を書きかえた可能性があるため）。
+  const getPastUnconfirmed = (classStudents, todayStr = toJstDateString()) => {
+    const targets = [];
+    classStudents.forEach(s => {
+      (classEntries[s.id]?.unconfirmed || []).forEach(e => {
+        if (e.date <= todayStr) targets.push({ studentId: s.id, entryId: e.id, date: e.date });
+      });
+    });
+    return targets;
+  };
+
+  const handleConfirmAllPast = async () => {
+    if (!viewingClass || isConfirmingAllPast) return;
+    const classStudents = studentsList.filter(s => s.classId === viewingClass.id);
+    const todayStr = toJstDateString();
+    const targets = getPastUnconfirmed(classStudents, todayStr);
+    if (targets.length === 0) {
+      alert('未確認の記録はありません。');
+      return;
+    }
+    const oldest = targets.reduce((min, t) => (t.date < min ? t.date : min), todayStr);
+    const studentCount = new Set(targets.map(t => t.studentId)).size;
+    if (!confirm(`${viewingClass.name} の ${oldest}〜${todayStr} の未確認 ${targets.length} 件（${studentCount}名分）を、すべて「先生確認」にしますか？\n\n※確認済みにした記録は、児童が削除できなくなります。`)) return;
+
+    setIsConfirmingAllPast(true);
+    try {
+      // 1回のまとめ書き込みは500件までなので、区切って送る
+      for (let i = 0; i < targets.length; i += 400) {
+        const batch = writeBatch(db);
+        targets.slice(i, i + 400).forEach(t => {
+          batch.update(doc(db, `users/${t.studentId}/entries`, t.entryId), { teacherSign: true });
+        });
+        await batch.commit();
+      }
+      alert(`${targets.length} 件を「先生確認」にしました。`);
+    } catch (e) {
+      console.error("Confirm all past failed", e);
+      alert('一括確認に失敗しました。途中まで確認済みになっている可能性があります。もう一度押すと残りを確認します。');
+    }
+    setIsConfirmingAllPast(false);
   };
 
   // --- 朝8時の自動「先生確認」---------------------------------------------
@@ -375,15 +542,15 @@ export default function App() {
   // --- Fetch Global Columns ---
   useEffect(() => {
     const columnsRef = doc(db, 'config', 'columns');
+    // ドキュメントがなくてもここでは作らない（児童には config の書き込み権限がなく、
+    // 書き込み失敗 → スナップショット再通知 → また書き込み…の繰り返しになるため）。
     const unsubscribeColumns = onSnapshot(columnsRef, (docSnap) => {
-      if (docSnap.exists()) {
-        setColumns(docSnap.data().data);
-      } else {
-        setDoc(columnsRef, { data: initialColumns });
-      }
+      const data = docSnap.exists() ? docSnap.data().data : null;
+      setColumns(Array.isArray(data) && data.length > 0 ? data : INITIAL_COLUMNS);
+    }, (error) => {
+      console.error("Error fetching columns:", error);
     });
     return () => unsubscribeColumns();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   // --- Fetch Student Data ---
@@ -407,24 +574,24 @@ export default function App() {
 
   const handleStudentLogin = async (e) => {
     e.preventDefault();
-    if (!studentIdInput || studentIdInput.length !== 6) {
-      alert("6桁のIDを入力してください。");
+    if (studentIdInput.length !== 8 && studentIdInput.length !== 6) {
+      alert("ログインばんごう（数字8けた）を入れてね。");
       return;
     }
     studentSessionBusyRef.current = true;
     setLoading(true);
     try {
-      const data = await activateStudentSession(studentIdInput);
+      const data = await activateStudentSession({ code: studentIdInput });
       if (data) {
-        setStudent({ id: studentIdInput, ...data });
-        localStorage.setItem('studentId', studentIdInput);
+        setStudent(data);
+        localStorage.setItem('studentId', data.id);
       } else {
-        alert("該当するIDが見つかりません。先生に確認してください。");
+        alert("ばんごうが見つかりません。先生にきいてね。");
       }
     } catch (error) {
       console.error(error);
       if (error.code === 'functions/not-found') {
-        alert("該当するIDが見つかりません。先生に確認してください。");
+        alert("ばんごうが見つかりません。先生にきいてね。");
       } else if (error.code === 'functions/resource-exhausted') {
         alert("まちがいが多かったので、10分くらい待ってからもう一度ためしてね。");
       } else {
@@ -522,8 +689,15 @@ export default function App() {
         createdAt: serverTimestamp(),
         createdBy: adminUser.email
       });
+      let codeText = '（発行に失敗しました。一覧の「ログイン番号を発行」から発行してください）';
+      try {
+        const [{ code }] = await issueLoginCodes([{ id: newIdStr }]);
+        codeText = formatLoginCode(code);
+      } catch (err) {
+        console.error('Issue login code failed', err);
+      }
       setNewStudentName('');
-      alert(`児童を登録しました。\nID: ${newIdStr}\n名前: ${newStudentName.trim()}\nクラス: ${classData?.name || ''}`);
+      alert(`児童を登録しました。\nログイン番号: ${codeText}\n名前: ${newStudentName.trim()}\nクラス: ${classData?.name || ''}`);
     } catch (error) {
       console.error("Add student failed", error);
       alert("登録に失敗しました。");
@@ -539,7 +713,8 @@ export default function App() {
       .join('、');
     if (!confirm(`以下の児童 ${selectedStudentIds.size}名 を削除しますか？\n${names}`)) return;
     try {
-      await Promise.all([...selectedStudentIds].map(id => deleteDoc(doc(db, 'students', id))));
+      const ids = [...selectedStudentIds];
+      for (let i = 0; i < ids.length; i += 200) await deleteStudentDocs(ids.slice(i, i + 200));
       setSelectedStudentIds(new Set());
     } catch (err) {
       console.error(err);
@@ -555,8 +730,8 @@ export default function App() {
         : studentsList.filter(s => s.classId === filterClassId);
 
     const bom = '\uFEFF';
-    const header = 'ID,クラス名,名前\n';
-    const rows = filtered.map(s => `${s.id},${s.className || ''},${s.name}`).join('\n');
+    const header = 'ID,クラス名,名前,ログイン番号\n';
+    const rows = filtered.map(s => `${s.id},${s.className || ''},${s.name},${s.loginCode || ''}`).join('\n');
     const blob = new Blob([bom + header + rows], { type: 'text/csv' });
     const url = URL.createObjectURL(blob);
     const a = document.createElement('a');
@@ -602,6 +777,7 @@ export default function App() {
     setLoading(true);
     let successCount = 0;
     const errors = [];
+    const createdIds = [];
 
     for (const [lineIndex, line] of dataLines.entries()) {
       const parts = line.split(',');
@@ -636,9 +812,19 @@ export default function App() {
           importOrder: lineIndex
         });
         successCount++;
+        createdIds.push(newIdStr);
       } catch (err) {
         console.error(err);
         errors.push(`「${name}」: 登録に失敗しました`);
+      }
+    }
+
+    if (createdIds.length > 0) {
+      try {
+        await issueLoginCodes(createdIds.map(id => ({ id })));
+      } catch (err) {
+        console.error('Issue login codes failed', err);
+        errors.push('ログイン番号の発行に失敗しました。一覧の「ログイン番号を発行」から発行してください');
       }
     }
 
@@ -682,7 +868,7 @@ export default function App() {
   const handleDeleteStudent = async (id, name) => {
     if (confirm(`本当に ${name} さん (ID: ${id}) の登録を削除してよろしいですか？\n※学習記録のデータは削除されません。`)) {
       try {
-        await deleteDoc(doc(db, 'students', id));
+        await deleteStudentDocs([id]);
       } catch (error) {
         console.error("Delete student failed", error);
         alert("削除に失敗しました。");
@@ -692,17 +878,18 @@ export default function App() {
 
   const handleAddAdmin = async (e) => {
     e.preventDefault();
-    if (!newAdminEmail.trim() || !newAdminEmail.includes('@')) {
+    const email = normalizeEmail(newAdminEmail);
+    if (!email || !email.includes('@')) {
       alert("有効なメールアドレスを入力してください。");
       return;
     }
     try {
-      await setDoc(doc(db, 'admins', newAdminEmail.trim()), {
+      await setDoc(doc(db, 'admins', email), {
         addedAt: serverTimestamp(),
         addedBy: adminUser.email
       });
       setNewAdminEmail('');
-      alert(`管理者として追加しました: ${newAdminEmail}`);
+      alert(`管理者として追加しました: ${email}`);
     } catch (error) {
       console.error("Add admin failed", error);
       alert("追加に失敗しました。");
@@ -741,7 +928,7 @@ export default function App() {
 
     columns.forEach(col => {
       if (col.type === 'number') {
-        newEntry[col.id] = col.options?.min || 1;
+        newEntry[col.id] = getNumberRange(col.options).min;
       } else if (col.type === 'text') {
         newEntry[col.id] = '';
       } else {
@@ -774,8 +961,10 @@ export default function App() {
   const updateEntry = async (id, field, value) => {
     if (!student) return;
 
-    // 日付変更時、別の記録と日付が重複しないかチェック
     if (field === 'date') {
+      // 日付が空の記録は先生のクラス画面（期間で絞り込み）に出てこなくなるので保存しない
+      if (!/^\d{4}-\d{2}-\d{2}$/.test(value || '')) return;
+      // 別の記録と日付が重複しないかチェック
       const duplicate = entries.some(e => e.id !== id && e.date === value);
       if (duplicate) {
         alert('その日付の記録はすでにあります。同じ日に複数の記録は登録できません。');
@@ -845,15 +1034,16 @@ export default function App() {
                   <span className="text-3xl">👦</span>
                 </div>
               </div>
-              <h1 className="text-xl font-bold text-slate-800 mb-6">じぶんのIDをいれてね</h1>
+              <h1 className="text-xl font-bold text-slate-800 mb-6">ログインばんごうをいれてね</h1>
               <form onSubmit={handleStudentLogin} className="space-y-4">
                 <input
                   type="text"
-                  maxLength={6}
+                  inputMode="numeric"
+                  autoComplete="off"
                   value={studentIdInput}
-                  onChange={(e) => setStudentIdInput(e.target.value)}
-                  className="w-full p-4 border-2 border-slate-300 rounded-lg focus:outline-none focus:border-blue-500 text-center text-3xl tracking-[0.5em] font-mono"
-                  placeholder="------"
+                  onChange={(e) => setStudentIdInput(e.target.value.replace(/[^\d]/g, '').slice(0, 8))}
+                  className="w-full p-4 border-2 border-slate-300 rounded-lg focus:outline-none focus:border-blue-500 text-center text-3xl tracking-[0.3em] font-mono"
+                  placeholder="--------"
                   autoFocus
                 />
                 <button
@@ -864,7 +1054,7 @@ export default function App() {
                 </button>
               </form>
               <p className="mt-4 text-xs text-slate-400">
-                ※IDは先生にきいてね。数字6桁です。
+                ※ばんごうは先生にきいてね。数字8けたです。
               </p>
             </div>
           )}
@@ -913,6 +1103,7 @@ export default function App() {
       const confirmedCount = allRangeEntries.filter(r => r.entry.teacherSign).length;
       const parentSignedCount = allRangeEntries.filter(r => r.entry.parentSign).length;
       const unconfirmedSubmittedCount = allRangeEntries.filter(r => !r.entry.teacherSign).length;
+      const pastUnconfirmedCount = getPastUnconfirmed(classStudents).length;
 
       // 表示用の行リストを構築（期間内に提出のある児童は提出ごとに1行、未提出児童は1行のみ）
       const tableRows = [];
@@ -1047,6 +1238,26 @@ export default function App() {
                   )}
                 </button>
               </div>
+              {/* 過去の未確認をすべて確認（期間の選択に関係なく、今日まで） */}
+              <div className="px-4 py-3 border-b border-slate-100 flex items-center justify-between gap-2">
+                <span className="text-sm text-slate-500">
+                  {pastUnconfirmedCount > 0
+                    ? `今日までの未確認（期間外もふくむ）: ${pastUnconfirmedCount}件`
+                    : '今日までの未確認はありません'}
+                </span>
+                <button
+                  onClick={handleConfirmAllPast}
+                  disabled={pastUnconfirmedCount === 0 || isConfirmingAllPast}
+                  className={`flex items-center gap-2 px-4 py-2 rounded-lg text-sm font-bold transition-all whitespace-nowrap ${
+                    pastUnconfirmedCount > 0 && !isConfirmingAllPast
+                      ? 'bg-white border border-indigo-600 text-indigo-700 hover:bg-indigo-50 active:scale-95'
+                      : 'bg-slate-100 text-slate-400 cursor-not-allowed'
+                  }`}
+                >
+                  <CheckCircle className="w-4 h-4" />
+                  {isConfirmingAllPast ? '確認中...' : '過去の未確認をすべて確認'}
+                </button>
+              </div>
               <div className="p-0 overflow-x-auto">
                 <table className="w-full text-left text-sm min-w-[760px]">
                   <thead className="bg-slate-50 text-slate-500 border-b border-slate-200">
@@ -1091,7 +1302,7 @@ export default function App() {
                               )}
                             </td>
                             <td className="p-4 text-slate-600">
-                              {hasEntry ? (entry.page || '-') : '-'}
+                              {hasEntry ? formatPage(entry.page) : '-'}
                             </td>
                             <td className="p-4 text-center">
                               {hasEntry && entry.parentSign ? (
@@ -1366,7 +1577,26 @@ export default function App() {
                 })}
                 <option value="none">クラス未設定</option>
               </select>
-              <div className="ml-auto flex items-center gap-2">
+              <div className="ml-auto flex items-center gap-2 flex-wrap justify-end">
+                {(() => {
+                  const filtered = filterClassId === 'all'
+                    ? studentsList
+                    : filterClassId === 'none'
+                      ? studentsList.filter(s => !s.classId)
+                      : studentsList.filter(s => s.classId === filterClassId);
+                  const missing = filtered.filter(s => !s.loginCode).length;
+                  if (missing === 0) return null;
+                  return (
+                    <button
+                      onClick={() => handleIssueMissingCodes(filtered)}
+                      disabled={loading}
+                      className="inline-flex items-center gap-2 bg-orange-500 hover:bg-orange-600 disabled:opacity-50 text-white px-4 py-2 rounded-lg text-sm font-semibold transition-colors whitespace-nowrap"
+                    >
+                      <KeyRound className="w-4 h-4" />
+                      ログイン番号を発行（未発行 {missing}名）
+                    </button>
+                  );
+                })()}
                 {selectedStudentIds.size > 0 && (
                   <button
                     onClick={handleBulkDelete}
@@ -1422,6 +1652,7 @@ export default function App() {
                       })()}
                     </th>
                     <th className="p-4 font-semibold">6桁ID</th>
+                    <th className="p-4 font-semibold">ログイン番号</th>
                     <th className="p-4 font-semibold">クラス</th>
                     <th className="p-4 font-semibold">名前</th>
                     <th className="p-4 font-semibold">登録日時</th>
@@ -1437,7 +1668,7 @@ export default function App() {
                         : studentsList.filter(s => s.classId === filterClassId);
                     if (filtered.length === 0) return (
                       <tr>
-                        <td colSpan="6" className="p-8 text-center text-slate-400">該当する児童はいません。</td>
+                        <td colSpan="7" className="p-8 text-center text-slate-400">該当する児童はいません。</td>
                       </tr>
                     );
                     return filtered.map(s => (
@@ -1460,6 +1691,9 @@ export default function App() {
                           <>
                             <td className="p-4 font-mono font-bold text-lg text-indigo-700 tracking-wider">
                               {s.id.substring(0,3)}-{s.id.substring(3,6)}
+                            </td>
+                            <td className="p-4 font-mono text-slate-700 whitespace-nowrap">
+                              {s.loginCode ? formatLoginCode(s.loginCode) : <span className="text-xs text-orange-500 font-sans">未発行</span>}
                             </td>
                             <td className="p-4">
                               <select
@@ -1509,6 +1743,9 @@ export default function App() {
                             <td className="p-4 font-mono font-bold text-lg text-indigo-700 tracking-wider">
                               {s.id.substring(0,3)}-{s.id.substring(3,6)}
                             </td>
+                            <td className="p-4 font-mono text-slate-700 whitespace-nowrap">
+                              {s.loginCode ? formatLoginCode(s.loginCode) : <span className="text-xs text-orange-500 font-sans">未発行</span>}
+                            </td>
                             <td className="p-4 font-medium text-slate-600">
                               {s.className || '-'}
                             </td>
@@ -1524,6 +1761,14 @@ export default function App() {
                                   title="音読カードを見る"
                                 >
                                   <Eye className="w-4 h-4" />
+                                </button>
+                                <button
+                                  onClick={() => handleReissueCode(s)}
+                                  disabled={!s.loginCode}
+                                  className="text-slate-400 hover:text-indigo-600 p-2 rounded-full hover:bg-indigo-50 transition-colors disabled:opacity-30 disabled:hover:bg-transparent"
+                                  title="ログイン番号を再発行"
+                                >
+                                  <RefreshCw className="w-4 h-4" />
                                 </button>
                                 <button
                                   onClick={() => startEditStudent(s)}
@@ -1550,6 +1795,43 @@ export default function App() {
               </table>
             </div>
           </div>
+
+          {/* 児童ログインの設定（マスターのみ） */}
+          {isMaster && (
+            <div className="bg-white rounded-xl shadow-sm border border-slate-200 overflow-hidden">
+              <div className="bg-indigo-50 p-4 border-b border-indigo-100">
+                <h2 className="font-bold flex items-center gap-2 text-indigo-900">
+                  <KeyRound className="w-5 h-5 text-indigo-600" /> 児童ログインの設定
+                </h2>
+                <p className="text-xs text-indigo-600 mt-1">
+                  児童は8桁のログイン番号でログインします。以前の6桁IDでのログインは、番号を配り終えたら止めてください。
+                </p>
+              </div>
+              <div className="p-6 flex flex-col md:flex-row md:items-center md:justify-between gap-4">
+                <div className="text-sm">
+                  <div className="font-medium text-slate-700">6桁の児童IDでのログイン</div>
+                  {allowLegacyId ? (
+                    <div className="text-orange-600 mt-1">受け付けています（総当たりに弱い状態です）</div>
+                  ) : (
+                    <div className="text-green-700 mt-1">止めています（8桁のログイン番号だけ使えます）</div>
+                  )}
+                  <div className="text-xs text-slate-400 mt-1">
+                    未発行の児童: {studentsList.filter(s => !s.loginCode).length}名 ／ すでにログインしている端末は、止めてもそのまま使えます。
+                  </div>
+                </div>
+                <button
+                  onClick={handleToggleLegacyId}
+                  className={`px-5 py-2.5 rounded-lg font-bold text-sm whitespace-nowrap transition-colors ${
+                    allowLegacyId
+                      ? 'bg-indigo-600 hover:bg-indigo-700 text-white'
+                      : 'bg-white border border-slate-300 text-slate-600 hover:bg-slate-50'
+                  }`}
+                >
+                  {allowLegacyId ? '6桁IDでのログインを止める' : '6桁IDでのログインを再開する'}
+                </button>
+              </div>
+            </div>
+          )}
 
           {/* 管理者設定セクション（マスターのみ） */}
           {isMaster && (
@@ -1721,6 +2003,7 @@ export default function App() {
                       <input
                         type="date"
                         value={entry.date}
+                        required
                         onChange={(e) => updateEntry(entry.id, 'date', e.target.value)}
                         className="w-full p-2 border border-slate-200 rounded-md focus:outline-none focus:ring-2 focus:ring-blue-400 text-sm"
                       />
@@ -1786,6 +2069,13 @@ export default function App() {
   );
 }
 
+// 読んだページの表示用。以前の不具合で保存された「P.NaN-25」「P.18-NaN」も「P.25」「P.18」と表示する
+const formatPage = (page) => {
+  if (!page) return '-';
+  const cleaned = page.replace(/NaN-|-NaN/g, '');
+  return cleaned === 'P.NaN' ? '-' : cleaned;
+};
+
 // ページ範囲選択コンポーネント
 const PageInput = ({ value, onChange }) => {
   // P.12-15 or P.12 or 12-15 or 12 etc... から start, end をパース
@@ -1803,24 +2093,38 @@ const PageInput = ({ value, onChange }) => {
   const { start, end } = parsePage(value);
   const pages = Array.from({ length: 200 }, (_, i) => i + 1);
 
+  // 「-」を選んだときは '' が来る。数字にすると NaN になるので null として扱う
+  const toPage = (v) => {
+    const n = parseInt(v);
+    return Number.isNaN(n) ? null : n;
+  };
+
+  const isSinglePage = start !== '' && start === end;
+
   const handleStartChange = (newStart) => {
-    const s = parseInt(newStart);
-    let e = end ? parseInt(end) : s;
-    if (e < s) e = s; // 終了ページが開始ページより小さい場合は合わせる
+    const s = toPage(newStart);
+    // 1ページだけのときに「-」を選んだら空にもどす
+    if (s === null && isSinglePage) return onChange('');
+    let e = toPage(end);
+    if (s !== null && (e === null || e < s)) e = s; // 終了ページが開始ページより小さい場合は合わせる
 
     updateValue(s, e);
   };
 
   const handleEndChange = (newEnd) => {
-    const e = parseInt(newEnd);
-    let s = start ? parseInt(start) : e;
-    if (s > e) s = e; // 開始ページが終了ページより大きい場合は合わせる
+    const e = toPage(newEnd);
+    if (e === null && isSinglePage) return onChange('');
+    let s = toPage(start);
+    if (e !== null && (s === null || s > e)) s = e; // 開始ページが終了ページより大きい場合は合わせる
 
     updateValue(s, e);
   };
 
   const updateValue = (s, e) => {
-    if (!s && !e) {
+    // 範囲（18〜25など）で片方だけ「-」にしたときは、もう片方のページだけを記録する
+    if (s === null) s = e;
+    if (e === null) e = s;
+    if (s === null) {
       onChange('');
       return;
     }
@@ -1864,14 +2168,14 @@ const DynamicInput = ({ type, options, value, onChange }) => {
   const safeValue = value ?? '';
 
   if (type === 'number') {
-    const min = Number(options?.min) || 1;
-    const max = Number(options?.max) || 5;
-    const range = Array.from({ length: max - min + 1 }, (_, i) => min + i);
+    const { min, max } = getNumberRange(options);
+    const count = Math.min(max - min + 1, NUMBER_RANGE_MAX_COUNT);
+    const range = Array.from({ length: count }, (_, i) => min + i);
 
     return (
       <select
         value={safeValue}
-        onChange={(e) => onChange(e.target.value)}
+        onChange={(e) => onChange(Number(e.target.value))}
         className="w-full p-2 border rounded-md focus:outline-none focus:ring-2 focus:ring-blue-400 text-center text-lg appearance-none cursor-pointer bg-white text-slate-700"
       >
         {range.map(num => (
@@ -1935,9 +2239,34 @@ const SettingsModal = ({ columns, onClose, onSave }) => {
   };
 
   const handleSave = async () => {
+    // 数字タイプの範囲を整数にそろえる（入力欄が空のままだと NaN が保存されていた）
+    const normalized = [];
+    for (const col of localColumns) {
+      if (col.type !== 'number') {
+        normalized.push(col);
+        continue;
+      }
+      const min = toIntOrNull(col.options?.min);
+      const max = toIntOrNull(col.options?.max);
+      const name = col.title || '数字の項目';
+      if (min === null || max === null) {
+        alert(`「${name}」の範囲に整数を入れてください。`);
+        return;
+      }
+      if (min > max) {
+        alert(`「${name}」の範囲は、左の数を右の数以下にしてください。`);
+        return;
+      }
+      if (max - min + 1 > NUMBER_RANGE_MAX_COUNT) {
+        alert(`「${name}」の範囲は${NUMBER_RANGE_MAX_COUNT}個以内にしてください。`);
+        return;
+      }
+      normalized.push({ ...col, options: { ...col.options, min, max } });
+    }
+
     setSaving(true);
     try {
-      await onSave(localColumns);
+      await onSave(normalized);
       onClose();
     } catch {
       setSaving(false);
@@ -2029,15 +2358,15 @@ const SettingsModal = ({ columns, onClose, onSave }) => {
                         <span className="text-xs text-slate-500">範囲:</span>
                         <input
                           type="number"
-                          value={col.options?.min || 1}
-                          onChange={(e) => handleUpdate(col.id, 'options.min', parseInt(e.target.value))}
+                          value={col.options?.min ?? NUMBER_RANGE_DEFAULT.min}
+                          onChange={(e) => handleUpdate(col.id, 'options.min', e.target.value)}
                           className="w-16 p-1 text-sm border rounded text-center"
                         />
                         <span className="text-slate-400">〜</span>
                         <input
                           type="number"
-                          value={col.options?.max || 5}
-                          onChange={(e) => handleUpdate(col.id, 'options.max', parseInt(e.target.value))}
+                          value={col.options?.max ?? NUMBER_RANGE_DEFAULT.max}
+                          onChange={(e) => handleUpdate(col.id, 'options.max', e.target.value)}
                           className="w-16 p-1 text-sm border rounded text-center"
                         />
                       </div>
@@ -2159,7 +2488,7 @@ const StudentCardPreviewModal = ({ student, entries, columns, onClose }) => {
                 {entries.map(entry => (
                   <tr key={entry.id} className="hover:bg-blue-50/30 transition-colors">
                     <td className="py-3 px-4 text-slate-700 font-medium whitespace-nowrap">{entry.date}</td>
-                    <td className="py-3 px-4 text-center text-slate-600">{entry.page || '-'}</td>
+                    <td className="py-3 px-4 text-center text-slate-600">{formatPage(entry.page)}</td>
                     {columns.map(col => (
                       <td key={col.id} className="py-3 px-4 text-center">
                         <span className={`text-lg ${getEvalStyle(entry[col.id])}`}>
