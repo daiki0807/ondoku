@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useRef } from 'react';
-import { Plus, Trash2, CheckCircle, PenTool, Save, Settings, X, Edit2, LogOut, Users, UserPlus, ChevronLeft, Eye } from 'lucide-react';
+import { Plus, Trash2, CheckCircle, PenTool, Save, Settings, X, Edit2, LogOut, Users, UserPlus, ChevronLeft, Eye, RefreshCw, KeyRound } from 'lucide-react';
 import { signInAnonymously, signOut, onAuthStateChanged, signInWithPopup } from "firebase/auth";
 import { collection, doc, onSnapshot, setDoc, deleteDoc, updateDoc, getDoc, getDocs, serverTimestamp, writeBatch } from "firebase/firestore";
 
@@ -8,20 +8,34 @@ import { db, auth, googleProvider, functions } from './firebase';
 import { httpsCallable } from 'firebase/functions';
 import { toJstDateString, getJstHours, addDaysToDateString, getDayOfWeek } from './dateUtils';
 
-// 児童ログイン: 匿名ログイン → 6桁IDを Cloud Functions で確認 → 「その児童本人」の鍵
-// （studentId クレーム）付きのトークンに更新 → 児童データを返す。
-// 鍵がすでに付いている端末では Cloud Functions を呼ばない。児童が存在しなければ null。
+// 児童ログイン: 匿名ログイン → 番号を Cloud Functions で確認 → 「その児童本人」の鍵
+// （studentId クレーム）付きのトークンに更新 → 児童データ（id つき）を返す。児童が存在しなければ null。
+//   code           : 入力された番号（8桁のログイン番号。切り替えスイッチがONのあいだは6桁の児童IDも可）
+//   savedStudentId : この端末に覚えている児童ID。鍵がすでに付いていれば Cloud Functions を呼ばない
 const studentLoginCallable = httpsCallable(functions, 'ondokuStudentLogin');
-const activateStudentSession = async (studentId) => {
+const activateStudentSession = async ({ code, savedStudentId }) => {
   if (!auth.currentUser) await signInAnonymously(auth);
   const tokenResult = await auth.currentUser.getIdTokenResult();
-  if (tokenResult.claims.studentId !== studentId) {
-    await studentLoginCallable({ studentId });
+  let studentId = null;
+  if (!code && savedStudentId && tokenResult.claims.studentId === savedStudentId) {
+    studentId = savedStudentId;
+  } else {
+    const sendCode = code ?? savedStudentId;
+    const res = await studentLoginCallable({ code: sendCode });
+    studentId = res.data?.studentId ?? sendCode; // 古い Cloud Functions は studentId を返さない
     await auth.currentUser.getIdToken(true);
   }
   const snap = await getDoc(doc(db, 'students', studentId));
-  return snap.exists() ? snap.data() : null;
+  return snap.exists() ? { id: studentId, ...snap.data() } : null;
 };
+
+// ログイン番号（8桁）を作る。推測されないよう暗号用の乱数を使う
+const generateLoginCode = () => {
+  const buf = new Uint32Array(1);
+  crypto.getRandomValues(buf);
+  return String(10000000 + (buf[0] % 90000000));
+};
+const formatLoginCode = (code) => (code ? `${code.slice(0, 4)}-${code.slice(4)}` : '');
 
 // 朝8時の自動「先生確認」を行うクラス名（担任クラスが変わったらここを直す）
 const AUTO_CONFIRM_CLASS_NAMES = ['3年3組'];
@@ -94,9 +108,9 @@ export default function App() {
       if (savedId) {
         studentSessionBusyRef.current = true;
         try {
-          const data = await activateStudentSession(savedId);
+          const data = await activateStudentSession({ savedStudentId: savedId });
           if (data) {
-            setStudent({ id: savedId, ...data });
+            setStudent(data);
           } else {
             localStorage.removeItem('studentId');
           }
@@ -212,6 +226,90 @@ export default function App() {
       unsubClasses();
     };
   }, [isAdmin, isMaster]);
+
+  // --- 児童ログインの設定（6桁IDでのログインを受け付けるか）---
+  // config/login がないときは受け付ける（Cloud Functions 側と同じ）
+  const [allowLegacyId, setAllowLegacyId] = useState(true);
+  useEffect(() => {
+    if (!isAdmin) return;
+    return onSnapshot(doc(db, 'config', 'login'), (snap) => {
+      setAllowLegacyId(!snap.exists() || snap.data().allowLegacyId !== false);
+    });
+  }, [isAdmin]);
+
+  const handleToggleLegacyId = async () => {
+    const next = !allowLegacyId;
+    const message = next
+      ? '6桁の児童IDでのログインを、もう一度受け付けますか？\n（6桁IDの総当たりに弱い状態にもどります）'
+      : '6桁の児童IDでのログインを止めますか？\n\n・すでにログインしている端末はそのまま使えます。\n・新しくログインするときは、8桁のログイン番号が必要になります。\n・ほかの先生のクラスにも効きます。全員にログイン番号を配り終えてから止めてください。';
+    if (!confirm(message)) return;
+    try {
+      await setDoc(doc(db, 'config', 'login'), { allowLegacyId: next, updatedAt: serverTimestamp(), updatedBy: adminUser.email });
+    } catch (e) {
+      console.error('Toggle legacy login failed', e);
+      alert('設定の変更に失敗しました。');
+    }
+  };
+
+  // ログイン番号を発行する（すでに番号がある児童は新しい番号に取りかえる）。
+  // loginCodes/{番号} は「作成のみ可・上書き不可」のルールなので、番号が重なったら失敗して作り直しになる。
+  const issueLoginCodes = async (targets) => {
+    const used = new Set(studentsList.map(s => s.loginCode).filter(Boolean));
+    const assignments = targets.map(t => {
+      let code;
+      do { code = generateLoginCode(); } while (used.has(code));
+      used.add(code);
+      return { ...t, code };
+    });
+    // 1回のまとめ書き込みは500件まで（1人につき最大3件書く）
+    for (let i = 0; i < assignments.length; i += 150) {
+      const batch = writeBatch(db);
+      assignments.slice(i, i + 150).forEach(({ id, oldCode, code }) => {
+        if (oldCode) batch.delete(doc(db, 'loginCodes', oldCode));
+        batch.set(doc(db, 'loginCodes', code), { studentId: id, createdAt: serverTimestamp() });
+        batch.update(doc(db, 'students', id), { loginCode: code });
+      });
+      await batch.commit();
+    }
+    return assignments;
+  };
+
+  const handleIssueMissingCodes = async (filteredStudents) => {
+    const targets = filteredStudents.filter(s => !s.loginCode);
+    if (targets.length === 0) return;
+    if (!confirm(`ログイン番号がまだない ${targets.length}名 に番号を発行しますか？`)) return;
+    setLoading(true);
+    try {
+      await issueLoginCodes(targets.map(s => ({ id: s.id })));
+      alert(`${targets.length}名 にログイン番号を発行しました。\n「CSVダウンロード」で番号の一覧を出せます。`);
+    } catch (e) {
+      console.error('Issue login codes failed', e);
+      alert('発行に失敗しました。もう一度押すと、まだの児童に発行します。');
+    }
+    setLoading(false);
+  };
+
+  const handleReissueCode = async (s) => {
+    if (!confirm(`${s.name} さんのログイン番号を新しくしますか？\n今の番号（${formatLoginCode(s.loginCode)}）は使えなくなります。\nすでにログインしている端末はそのまま使えます。`)) return;
+    try {
+      const [{ code }] = await issueLoginCodes([{ id: s.id, oldCode: s.loginCode }]);
+      alert(`${s.name} さんの新しいログイン番号: ${formatLoginCode(code)}`);
+    } catch (e) {
+      console.error('Reissue login code failed', e);
+      alert('再発行に失敗しました。');
+    }
+  };
+
+  // 児童を削除するときは、その児童のログイン番号も消す
+  const deleteStudentDocs = async (ids) => {
+    const batch = writeBatch(db);
+    ids.forEach(id => {
+      const code = studentsList.find(s => s.id === id)?.loginCode;
+      if (code) batch.delete(doc(db, 'loginCodes', code));
+      batch.delete(doc(db, 'students', id));
+    });
+    await batch.commit();
+  };
 
   // --- Fetch Class Detail Data ---
   useEffect(() => {
@@ -455,24 +553,24 @@ export default function App() {
 
   const handleStudentLogin = async (e) => {
     e.preventDefault();
-    if (!studentIdInput || studentIdInput.length !== 6) {
-      alert("6桁のIDを入力してください。");
+    if (studentIdInput.length !== 8 && studentIdInput.length !== 6) {
+      alert("ログインばんごう（数字8けた）を入れてね。");
       return;
     }
     studentSessionBusyRef.current = true;
     setLoading(true);
     try {
-      const data = await activateStudentSession(studentIdInput);
+      const data = await activateStudentSession({ code: studentIdInput });
       if (data) {
-        setStudent({ id: studentIdInput, ...data });
-        localStorage.setItem('studentId', studentIdInput);
+        setStudent(data);
+        localStorage.setItem('studentId', data.id);
       } else {
-        alert("該当するIDが見つかりません。先生に確認してください。");
+        alert("ばんごうが見つかりません。先生にきいてね。");
       }
     } catch (error) {
       console.error(error);
       if (error.code === 'functions/not-found') {
-        alert("該当するIDが見つかりません。先生に確認してください。");
+        alert("ばんごうが見つかりません。先生にきいてね。");
       } else if (error.code === 'functions/resource-exhausted') {
         alert("まちがいが多かったので、10分くらい待ってからもう一度ためしてね。");
       } else {
@@ -570,8 +668,15 @@ export default function App() {
         createdAt: serverTimestamp(),
         createdBy: adminUser.email
       });
+      let codeText = '（発行に失敗しました。一覧の「ログイン番号を発行」から発行してください）';
+      try {
+        const [{ code }] = await issueLoginCodes([{ id: newIdStr }]);
+        codeText = formatLoginCode(code);
+      } catch (err) {
+        console.error('Issue login code failed', err);
+      }
       setNewStudentName('');
-      alert(`児童を登録しました。\nID: ${newIdStr}\n名前: ${newStudentName.trim()}\nクラス: ${classData?.name || ''}`);
+      alert(`児童を登録しました。\nログイン番号: ${codeText}\n名前: ${newStudentName.trim()}\nクラス: ${classData?.name || ''}`);
     } catch (error) {
       console.error("Add student failed", error);
       alert("登録に失敗しました。");
@@ -587,7 +692,8 @@ export default function App() {
       .join('、');
     if (!confirm(`以下の児童 ${selectedStudentIds.size}名 を削除しますか？\n${names}`)) return;
     try {
-      await Promise.all([...selectedStudentIds].map(id => deleteDoc(doc(db, 'students', id))));
+      const ids = [...selectedStudentIds];
+      for (let i = 0; i < ids.length; i += 200) await deleteStudentDocs(ids.slice(i, i + 200));
       setSelectedStudentIds(new Set());
     } catch (err) {
       console.error(err);
@@ -603,8 +709,8 @@ export default function App() {
         : studentsList.filter(s => s.classId === filterClassId);
 
     const bom = '\uFEFF';
-    const header = 'ID,クラス名,名前\n';
-    const rows = filtered.map(s => `${s.id},${s.className || ''},${s.name}`).join('\n');
+    const header = 'ID,クラス名,名前,ログイン番号\n';
+    const rows = filtered.map(s => `${s.id},${s.className || ''},${s.name},${s.loginCode || ''}`).join('\n');
     const blob = new Blob([bom + header + rows], { type: 'text/csv' });
     const url = URL.createObjectURL(blob);
     const a = document.createElement('a');
@@ -650,6 +756,7 @@ export default function App() {
     setLoading(true);
     let successCount = 0;
     const errors = [];
+    const createdIds = [];
 
     for (const [lineIndex, line] of dataLines.entries()) {
       const parts = line.split(',');
@@ -684,9 +791,19 @@ export default function App() {
           importOrder: lineIndex
         });
         successCount++;
+        createdIds.push(newIdStr);
       } catch (err) {
         console.error(err);
         errors.push(`「${name}」: 登録に失敗しました`);
+      }
+    }
+
+    if (createdIds.length > 0) {
+      try {
+        await issueLoginCodes(createdIds.map(id => ({ id })));
+      } catch (err) {
+        console.error('Issue login codes failed', err);
+        errors.push('ログイン番号の発行に失敗しました。一覧の「ログイン番号を発行」から発行してください');
       }
     }
 
@@ -730,7 +847,7 @@ export default function App() {
   const handleDeleteStudent = async (id, name) => {
     if (confirm(`本当に ${name} さん (ID: ${id}) の登録を削除してよろしいですか？\n※学習記録のデータは削除されません。`)) {
       try {
-        await deleteDoc(doc(db, 'students', id));
+        await deleteStudentDocs([id]);
       } catch (error) {
         console.error("Delete student failed", error);
         alert("削除に失敗しました。");
@@ -893,15 +1010,16 @@ export default function App() {
                   <span className="text-3xl">👦</span>
                 </div>
               </div>
-              <h1 className="text-xl font-bold text-slate-800 mb-6">じぶんのIDをいれてね</h1>
+              <h1 className="text-xl font-bold text-slate-800 mb-6">ログインばんごうをいれてね</h1>
               <form onSubmit={handleStudentLogin} className="space-y-4">
                 <input
                   type="text"
-                  maxLength={6}
+                  inputMode="numeric"
+                  autoComplete="off"
                   value={studentIdInput}
-                  onChange={(e) => setStudentIdInput(e.target.value)}
-                  className="w-full p-4 border-2 border-slate-300 rounded-lg focus:outline-none focus:border-blue-500 text-center text-3xl tracking-[0.5em] font-mono"
-                  placeholder="------"
+                  onChange={(e) => setStudentIdInput(e.target.value.replace(/[^\d]/g, '').slice(0, 8))}
+                  className="w-full p-4 border-2 border-slate-300 rounded-lg focus:outline-none focus:border-blue-500 text-center text-3xl tracking-[0.3em] font-mono"
+                  placeholder="--------"
                   autoFocus
                 />
                 <button
@@ -912,7 +1030,7 @@ export default function App() {
                 </button>
               </form>
               <p className="mt-4 text-xs text-slate-400">
-                ※IDは先生にきいてね。数字6桁です。
+                ※ばんごうは先生にきいてね。数字8けたです。
               </p>
             </div>
           )}
@@ -1435,7 +1553,26 @@ export default function App() {
                 })}
                 <option value="none">クラス未設定</option>
               </select>
-              <div className="ml-auto flex items-center gap-2">
+              <div className="ml-auto flex items-center gap-2 flex-wrap justify-end">
+                {(() => {
+                  const filtered = filterClassId === 'all'
+                    ? studentsList
+                    : filterClassId === 'none'
+                      ? studentsList.filter(s => !s.classId)
+                      : studentsList.filter(s => s.classId === filterClassId);
+                  const missing = filtered.filter(s => !s.loginCode).length;
+                  if (missing === 0) return null;
+                  return (
+                    <button
+                      onClick={() => handleIssueMissingCodes(filtered)}
+                      disabled={loading}
+                      className="inline-flex items-center gap-2 bg-orange-500 hover:bg-orange-600 disabled:opacity-50 text-white px-4 py-2 rounded-lg text-sm font-semibold transition-colors whitespace-nowrap"
+                    >
+                      <KeyRound className="w-4 h-4" />
+                      ログイン番号を発行（未発行 {missing}名）
+                    </button>
+                  );
+                })()}
                 {selectedStudentIds.size > 0 && (
                   <button
                     onClick={handleBulkDelete}
@@ -1491,6 +1628,7 @@ export default function App() {
                       })()}
                     </th>
                     <th className="p-4 font-semibold">6桁ID</th>
+                    <th className="p-4 font-semibold">ログイン番号</th>
                     <th className="p-4 font-semibold">クラス</th>
                     <th className="p-4 font-semibold">名前</th>
                     <th className="p-4 font-semibold">登録日時</th>
@@ -1506,7 +1644,7 @@ export default function App() {
                         : studentsList.filter(s => s.classId === filterClassId);
                     if (filtered.length === 0) return (
                       <tr>
-                        <td colSpan="6" className="p-8 text-center text-slate-400">該当する児童はいません。</td>
+                        <td colSpan="7" className="p-8 text-center text-slate-400">該当する児童はいません。</td>
                       </tr>
                     );
                     return filtered.map(s => (
@@ -1529,6 +1667,9 @@ export default function App() {
                           <>
                             <td className="p-4 font-mono font-bold text-lg text-indigo-700 tracking-wider">
                               {s.id.substring(0,3)}-{s.id.substring(3,6)}
+                            </td>
+                            <td className="p-4 font-mono text-slate-700 whitespace-nowrap">
+                              {s.loginCode ? formatLoginCode(s.loginCode) : <span className="text-xs text-orange-500 font-sans">未発行</span>}
                             </td>
                             <td className="p-4">
                               <select
@@ -1578,6 +1719,9 @@ export default function App() {
                             <td className="p-4 font-mono font-bold text-lg text-indigo-700 tracking-wider">
                               {s.id.substring(0,3)}-{s.id.substring(3,6)}
                             </td>
+                            <td className="p-4 font-mono text-slate-700 whitespace-nowrap">
+                              {s.loginCode ? formatLoginCode(s.loginCode) : <span className="text-xs text-orange-500 font-sans">未発行</span>}
+                            </td>
                             <td className="p-4 font-medium text-slate-600">
                               {s.className || '-'}
                             </td>
@@ -1593,6 +1737,14 @@ export default function App() {
                                   title="音読カードを見る"
                                 >
                                   <Eye className="w-4 h-4" />
+                                </button>
+                                <button
+                                  onClick={() => handleReissueCode(s)}
+                                  disabled={!s.loginCode}
+                                  className="text-slate-400 hover:text-indigo-600 p-2 rounded-full hover:bg-indigo-50 transition-colors disabled:opacity-30 disabled:hover:bg-transparent"
+                                  title="ログイン番号を再発行"
+                                >
+                                  <RefreshCw className="w-4 h-4" />
                                 </button>
                                 <button
                                   onClick={() => startEditStudent(s)}
@@ -1619,6 +1771,43 @@ export default function App() {
               </table>
             </div>
           </div>
+
+          {/* 児童ログインの設定（マスターのみ） */}
+          {isMaster && (
+            <div className="bg-white rounded-xl shadow-sm border border-slate-200 overflow-hidden">
+              <div className="bg-indigo-50 p-4 border-b border-indigo-100">
+                <h2 className="font-bold flex items-center gap-2 text-indigo-900">
+                  <KeyRound className="w-5 h-5 text-indigo-600" /> 児童ログインの設定
+                </h2>
+                <p className="text-xs text-indigo-600 mt-1">
+                  児童は8桁のログイン番号でログインします。以前の6桁IDでのログインは、番号を配り終えたら止めてください。
+                </p>
+              </div>
+              <div className="p-6 flex flex-col md:flex-row md:items-center md:justify-between gap-4">
+                <div className="text-sm">
+                  <div className="font-medium text-slate-700">6桁の児童IDでのログイン</div>
+                  {allowLegacyId ? (
+                    <div className="text-orange-600 mt-1">受け付けています（総当たりに弱い状態です）</div>
+                  ) : (
+                    <div className="text-green-700 mt-1">止めています（8桁のログイン番号だけ使えます）</div>
+                  )}
+                  <div className="text-xs text-slate-400 mt-1">
+                    未発行の児童: {studentsList.filter(s => !s.loginCode).length}名 ／ すでにログインしている端末は、止めてもそのまま使えます。
+                  </div>
+                </div>
+                <button
+                  onClick={handleToggleLegacyId}
+                  className={`px-5 py-2.5 rounded-lg font-bold text-sm whitespace-nowrap transition-colors ${
+                    allowLegacyId
+                      ? 'bg-indigo-600 hover:bg-indigo-700 text-white'
+                      : 'bg-white border border-slate-300 text-slate-600 hover:bg-slate-50'
+                  }`}
+                >
+                  {allowLegacyId ? '6桁IDでのログインを止める' : '6桁IDでのログインを再開する'}
+                </button>
+              </div>
+            </div>
+          )}
 
           {/* 管理者設定セクション（マスターのみ） */}
           {isMaster && (

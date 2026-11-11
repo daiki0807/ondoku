@@ -60,6 +60,14 @@ service cloud.firestore {
       allow write: if isMaster();
     }
 
+    // ログイン番号（8桁） → 児童ID の対応表。児童のログインは Cloud Functions が読む。
+    //   上書き禁止（作成のみ）にして、番号が重ならないことをルールで保証する
+    match /loginCodes/{code} {
+      allow read: if isAdmin();
+      allow create, delete: if isAdmin();
+      allow update: if false;
+    }
+
     // 児童の記録: 管理者と、その児童本人のみ読み書き可。ただし
     //   - teacherSign は管理者のみ変更可
     //   - 先生確認済みの記録は、管理者以外は削除できない（誤操作による消失防止）
