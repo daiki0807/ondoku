@@ -1160,7 +1160,7 @@ export default function App() {
                               )}
                             </td>
                             <td className="p-4 text-slate-600">
-                              {hasEntry ? (entry.page || '-') : '-'}
+                              {hasEntry ? formatPage(entry.page) : '-'}
                             </td>
                             <td className="p-4 text-center">
                               {hasEntry && entry.parentSign ? (
@@ -1855,6 +1855,13 @@ export default function App() {
   );
 }
 
+// 読んだページの表示用。以前の不具合で保存された「P.NaN-25」「P.18-NaN」も「P.25」「P.18」と表示する
+const formatPage = (page) => {
+  if (!page) return '-';
+  const cleaned = page.replace(/NaN-|-NaN/g, '');
+  return cleaned === 'P.NaN' ? '-' : cleaned;
+};
+
 // ページ範囲選択コンポーネント
 const PageInput = ({ value, onChange }) => {
   // P.12-15 or P.12 or 12-15 or 12 etc... から start, end をパース
@@ -1872,24 +1879,38 @@ const PageInput = ({ value, onChange }) => {
   const { start, end } = parsePage(value);
   const pages = Array.from({ length: 200 }, (_, i) => i + 1);
 
+  // 「-」を選んだときは '' が来る。数字にすると NaN になるので null として扱う
+  const toPage = (v) => {
+    const n = parseInt(v);
+    return Number.isNaN(n) ? null : n;
+  };
+
+  const isSinglePage = start !== '' && start === end;
+
   const handleStartChange = (newStart) => {
-    const s = parseInt(newStart);
-    let e = end ? parseInt(end) : s;
-    if (e < s) e = s; // 終了ページが開始ページより小さい場合は合わせる
+    const s = toPage(newStart);
+    // 1ページだけのときに「-」を選んだら空にもどす
+    if (s === null && isSinglePage) return onChange('');
+    let e = toPage(end);
+    if (s !== null && (e === null || e < s)) e = s; // 終了ページが開始ページより小さい場合は合わせる
 
     updateValue(s, e);
   };
 
   const handleEndChange = (newEnd) => {
-    const e = parseInt(newEnd);
-    let s = start ? parseInt(start) : e;
-    if (s > e) s = e; // 開始ページが終了ページより大きい場合は合わせる
+    const e = toPage(newEnd);
+    if (e === null && isSinglePage) return onChange('');
+    let s = toPage(start);
+    if (e !== null && (s === null || s > e)) s = e; // 開始ページが終了ページより大きい場合は合わせる
 
     updateValue(s, e);
   };
 
   const updateValue = (s, e) => {
-    if (!s && !e) {
+    // 範囲（18〜25など）で片方だけ「-」にしたときは、もう片方のページだけを記録する
+    if (s === null) s = e;
+    if (e === null) e = s;
+    if (s === null) {
       onChange('');
       return;
     }
@@ -2228,7 +2249,7 @@ const StudentCardPreviewModal = ({ student, entries, columns, onClose }) => {
                 {entries.map(entry => (
                   <tr key={entry.id} className="hover:bg-blue-50/30 transition-colors">
                     <td className="py-3 px-4 text-slate-700 font-medium whitespace-nowrap">{entry.date}</td>
-                    <td className="py-3 px-4 text-center text-slate-600">{entry.page || '-'}</td>
+                    <td className="py-3 px-4 text-center text-slate-600">{formatPage(entry.page)}</td>
                     {columns.map(col => (
                       <td key={col.id} className="py-3 px-4 text-center">
                         <span className={`text-lg ${getEvalStyle(entry[col.id])}`}>
