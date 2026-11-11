@@ -1,16 +1,239 @@
-# React + Vite
+# デジタル音読・計算カード
 
-This template provides a minimal setup to get React working in Vite with HMR and some ESLint rules.
+児童がタブレットで毎日の音読・計算の記録をつけ、保護者と先生が確認するための Web アプリです。
+React + Vite で作った画面を Firebase Hosting で公開し、データは Firestore に保存しています。
 
-Currently, two official plugins are available:
+この README は、アプリを運用する先生向けの手順書です。
+**同じ Firebase プロジェクトに他のアプリも入っているため、特に「4. デプロイ」の手順は必ず守ってください。**
 
-- [@vitejs/plugin-react](https://github.com/vitejs/vite-plugin-react/blob/main/packages/plugin-react) uses [Babel](https://babeljs.io/) (or [oxc](https://oxc.rs) when used in [rolldown-vite](https://vite.dev/guide/rolldown)) for Fast Refresh
-- [@vitejs/plugin-react-swc](https://github.com/vitejs/vite-plugin-react/blob/main/packages/plugin-react-swc) uses [SWC](https://swc.rs/) for Fast Refresh
+---
 
-## React Compiler
+## 1. このアプリでできること
 
-The React Compiler is not enabled on this template because of its impact on dev & build performances. To add it, see [this documentation](https://react.dev/learn/react-compiler/installation).
+| だれが | できること |
+| --- | --- |
+| 児童 | 8桁のログイン番号でログインし、その日の音読・計算カードを記録する（1日1回） |
+| 保護者 | 児童の端末で、記録の「保護者」欄をタップして承認する |
+| 先生（管理者） | Google アカウントでログインし、クラスごとに記録を見て「先生確認」をつける。「過去の未確認をすべて確認」でまとめて確認もできる |
+| 先生（管理者） | 管理者ダッシュボードで、児童の登録（1人ずつ／CSVで一括）、ログイン番号の発行・再発行、児童一覧のCSVダウンロード、カードの項目設定を行う |
+| マスター管理者 | 上に加えて、クラスの作成、他の先生（管理者）の追加・削除、「児童ログインの設定」（6桁IDでのログインを止める／再開する）を行う |
 
-## Expanding the ESLint configuration
+- 管理者になれるのは、マスター管理者と、マスター管理者が追加した Google アカウントだけです。Google でログインしただけでは管理者になりません。
+- 「先生確認」は管理者しかつけられません。先生確認ずみの記録は、児童側からは消せません。
 
-If you are developing a production application, we recommend using TypeScript with type-aware lint rules enabled. Check out the [TS template](https://github.com/vitejs/vite/tree/main/packages/create-vite/template-react-ts) for information on how to integrate TypeScript and [`typescript-eslint`](https://typescript-eslint.io) in your project.
+---
+
+## 2. 構成
+
+| 項目 | 値 | 書いてある場所 |
+| --- | --- | --- |
+| Firebase プロジェクト | `helpful-passage-430405-b3` | `.firebaserc`、`src/firebase.js` |
+| Firestore のデータベース | `ondoku-db`（`(default)` ではありません） | `firebase.json`、`src/firebase.js`、`functions/index.js` |
+| Firestore のルール | `firestore.rules` | `firebase.json` |
+| Hosting のサイト | `ondoku-app-v1`（公開するのは `npm run build` で作られる `dist` フォルダ） | `firebase.json` |
+| Cloud Functions のグループ（codebase） | `ondoku`（中身は `functions` フォルダ、Node.js 22） | `firebase.json` |
+| Cloud Functions の関数 | `ondokuStudentLogin`（リージョン `asia-northeast1`＝東京） | `functions/index.js` |
+
+### 同じプロジェクトに他のアプリがあります
+
+`helpful-passage-430405-b3` には、このアプリ以外のアプリ（別の Hosting サイト、別のデータベース、別の Cloud Functions）も入っています。
+そのため、
+
+- デプロイは必ず `--only` で「このアプリの分だけ」に絞ります（→ 4. デプロイ）。
+- Firebase コンソールで作業するときは、データベースが `ondoku-db`、Hosting のサイトが `ondoku-app-v1` になっているか確かめてから操作してください。
+
+### Firestore の主なデータ（ondoku-db）
+
+| コレクション | 中身 |
+| --- | --- |
+| `students/{児童ID}` | 児童の名前・クラス・ログイン番号（児童IDは6桁） |
+| `users/{児童ID}/entries/{記録ID}` | 毎日の記録。`parentSign`（保護者）、`teacherSign`（先生確認）など |
+| `classes/{クラスID}` | クラス（名前は「3年3組」のような文字） |
+| `loginCodes/{8桁の番号}` | ログイン番号 → 児童ID の対応表 |
+| `config/login` | `allowLegacyId`（6桁IDでのログインを受け付けるか） |
+| `config/columns` | カードの項目設定 |
+| `admins/{メールアドレス}` | マスター以外の管理者 |
+| `loginFailures/…` | ログインの失敗回数（Cloud Functions だけが使う。画面からは読み書きできない） |
+
+---
+
+## 3. 手元での起動と、エミュレータでの動作確認
+
+本番のデータを触らずに、自分のパソコンの中だけで動かして確かめる方法です。
+画面やルール、Cloud Functions を変えたときは、デプロイの前にここで確認してください。
+
+### 3-1. 準備（最初の1回だけ）
+
+- Node.js 22
+- Firebase CLI：`npm install -g firebase-tools` で入れ、`firebase login` でログインしておく
+- Java（Firestore のエミュレータを動かすのに必要）
+
+### 3-2. 必要な部品を入れる
+
+このフォルダ（`README.md` がある場所）で：
+
+```bash
+npm ci
+```
+
+```bash
+cd functions && npm ci
+```
+
+`cd functions` で移動したら、`cd ..` で元のフォルダに戻ってください。
+
+### 3-3. エミュレータを起動する
+
+```bash
+firebase emulators:start --only auth,functions,firestore
+```
+
+「All emulators ready!」と出たら起動完了です。このターミナルは開いたままにします。
+使うポート番号は `firebase.json` の `emulators` に書いてあります（Auth 9099、Functions 5001、Firestore 8089）。
+
+### 3-4. 画面をエミュレータにつないで起動する
+
+別のターミナルを開き、このフォルダで：
+
+```bash
+VITE_USE_EMULATORS=true npm run dev
+```
+
+表示された `http://localhost:5173` などのアドレスをブラウザで開きます。
+`VITE_USE_EMULATORS=true` をつけたときだけ、画面は本番ではなく手元のエミュレータにつながります（`src/firebase.js` の最後の部分）。
+**つけ忘れて `npm run dev` だけで起動すると、本番のデータにつながる**ので注意してください。
+
+### 3-5. エミュレータで試すときのコツ
+
+- エミュレータのデータは空っぽから始まり、止めると消えます。
+- 先生としてログインすると、本物の Google の画面のかわりにエミュレータの画面が出ます。そこでマスター管理者のメールアドレス（`firestore.rules` の `isMaster()` に書いてあるもの）を入れると、マスター管理者として入れます。
+- マスター管理者でクラスを作り、児童を登録してログイン番号を発行すると、児童ログインまで一通り試せます。
+
+---
+
+## 4. デプロイ（本番に出す）―― 他のアプリに影響しない方法
+
+### 大事なルール
+
+- **必ず `--only` をつけて、このアプリの分だけに絞ってデプロイします。**
+- **`--only` なしの `firebase deploy` は使わないでください。** 同じプロジェクトの他のアプリまで巻きこむおそれがあります。
+- 下の ①・② の順番を守ってください。①が成功したのを確かめてから②に進みます。
+
+### ① ルールと Cloud Functions を出す
+
+```bash
+firebase deploy --project helpful-passage-430405-b3 --only firestore:rules,functions:ondoku
+```
+
+- `firestore:rules` … `firestore.rules` を `ondoku-db` に反映します（`firebase.json` に書いてあるのは `ondoku-db` だけなので、他のデータベースのルールは変わりません）。
+- `functions:ondoku` … Cloud Functions のうち、グループ（codebase）`ondoku` だけを出します。他のアプリの関数には触れません。
+
+### ② 画面（Hosting）を出す
+
+①が成功してから、まず画面をビルドし（`dist` フォルダが新しく作られます）、
+
+```bash
+npm run build
+```
+
+それから Hosting に出します。
+
+```bash
+firebase deploy --project helpful-passage-430405-b3 --only hosting:ondoku-app-v1
+```
+
+`hosting:ondoku-app-v1` で、サイト `ondoku-app-v1` だけを更新します。他のサイトには触れません。
+`firebase.json` には自動でビルドする設定がないので、`npm run build` を忘れると古い画面のまま出てしまいます。
+
+### なぜ Cloud Functions を先に出すのか
+
+児童ログインのとき、画面は Cloud Functions（`ondokuStudentLogin`）に番号を送ります。
+
+- 新しい画面は `{ code }` という形で送ります。
+- 古い画面は `{ studentId }` という形で送ります。
+- **新しい Cloud Functions はどちらの形も受け付けます。古い Cloud Functions は新しい画面の `{ code }` を受け付けません。**
+
+画面を先に出すと、関数が新しくなるまでのあいだ、児童がログインできなくなります。関数を先に出せば、その間に古い画面を開いている児童もそのままログインできます。
+
+### 困ったとき
+
+- 画面だけ前の状態に戻したいときは、Firebase コンソールの Hosting で、サイト `ondoku-app-v1` のリリース履歴から前のバージョンに「ロールバック」できます。
+
+---
+
+## 5. 児童ログインの仕組みと、ログイン番号の配り方
+
+### 仕組み
+
+1. 児童の端末は、まず名前のない「匿名ログイン」をします。
+2. 児童が番号を入れると、Cloud Functions `ondokuStudentLogin` がその番号を確かめます。
+   - **8桁のログイン番号**：`loginCodes/{番号}` を見て、どの児童かを調べます。
+   - **6桁の児童ID**：`config/login` の `allowLegacyId` が「受け付ける」のあいだだけ使えます（以前のログイン方法）。
+3. 児童が見つかると、その端末に「この児童本人」という印（`studentId`）をつけます。Firestore のルールはこの印を見て、「自分の記録だけ読み書きできる」ようにしています。
+4. 一度ログインした端末は、ページを開き直してもログインしたままです。
+
+`config/login` がまだないときは、6桁IDでのログインを受け付けます（番号を配り終える前に、今の端末が入れなくならないようにするため）。
+
+### ログイン番号の配り方
+
+1. **番号を発行する**
+   管理者ダッシュボードの「児童の管理」で、「ログイン番号を発行（未発行 ○名）」を押します。上のクラスの絞りこみで、自分のクラスだけに発行できます。
+   新しく登録した児童には、登録のときに番号が自動で発行されます。
+2. **CSVで配る**
+   「CSVダウンロード」を押すと `児童一覧.csv`（ID・クラス名・名前・ログイン番号）が出ます。これをもとに、児童ごとの番号を印刷するなどして配ります。
+   画面では `1234-5678` のように区切って表示されますが、児童は数字8けたを続けて入れれば大丈夫です。
+3. **配り終えたら、6桁IDでのログインを止める**
+   マスター管理者の画面の「児童ログインの設定」で「6桁IDでのログインを止める」を押します（`config/login` の `allowLegacyId` が `false` になります）。
+   - **全クラスに効きます。** 他の先生のクラスも含めて、全員に番号を配り終えてから止めてください。画面の「未発行の児童：○名」が 0 になっているかが目安です。
+   - **すでにログインしている端末は、止めたあともそのまま使えます。**
+   - 止めたあとに「ログアウト」した端末や、ブラウザのデータを消した端末は、8桁のログイン番号で入り直す必要があります。
+   - 困ったときは、同じ場所の「6桁IDでのログインを再開する」で元に戻せます。
+
+番号をなくした・知られてしまった児童は、児童一覧の再発行ボタンで新しい番号にできます。古い番号は使えなくなりますが、すでにログインしている端末はそのまま使えます。
+
+### 番号のまちがいが続いたとき（試行回数の制限）
+
+番号の総当たりを防ぐため、まちがった番号での試行に上限があります（`functions/index.js` の `MAX_FAILURES_PER_DEVICE`・`MAX_FAILURES_PER_IP`）。
+
+| 単位 | 上限 | 数え直し |
+| --- | --- | --- |
+| 端末ごと | 10回 | 10分ごと |
+| 接続元のIPアドレスごと | 60回 | 10分ごと |
+
+- 上限をこえると、児童の画面に「まちがいが多かったので、10分くらい待ってからもう一度ためしてね。」と出ます。そのあいだは**正しい番号を入れても入れません**。10分ほど待てば、また入れるようになります。
+- 学校の中では、全員が同じIPアドレスから接続していることが多いです。**学校全体のまちがいの合計が10分で60回をこえると、学校中の端末がしばらくログインできなくなります。** 一斉にログインさせるときは、番号の入れまちがいに気をつけてください（すでにログインしている端末には影響しません）。
+
+---
+
+## 6. 朝8時の自動「先生確認」
+
+担任のクラスについて、未確認の記録を毎朝自動で「先生確認ずみ」にする機能です。
+
+- **対象のクラス**：`src/App.jsx` の上の方にある `AUTO_CONFIRM_CLASS_NAMES` に書いたクラスだけです。今は `['3年3組']` です。他の先生のクラスには触れません。
+- **対象の記録**：前日と当日の未確認の記録。月曜日は、金・土・日・月の分です。
+- **動くタイミング**：サーバーが8時に自動で動くのではありません。**日本時間の朝8時を過ぎてから、管理者が管理画面を開いたとき**に、そのブラウザで1日1回動きます。だれも開かなければ動きません（次に開いたときに、その日から見た前日・当日の分が確認されます）。
+
+### 担任のクラスが変わったら（毎年度の作業）
+
+1. `src/App.jsx` の次の行を、新しいクラス名に直します。クラス名は、管理画面の「クラスの管理」で作った名前と**一字一句同じ**にしてください（例：`3年3組`。数字の全角・半角もそろえる）。
+
+   ```js
+   const AUTO_CONFIRM_CLASS_NAMES = ['3年3組'];
+   ```
+
+   複数のクラスを対象にするときは `['3年3組', '4年1組']` のように並べます。自動確認を使わないときは `[]` にします。
+2. 画面だけの変更なので、「4. デプロイ」の②（`npm run build` → `--only hosting:ondoku-app-v1`）で出せば反映されます。
+
+名前が一致するクラスが見つからないときは、自動確認は何もしません（全クラスに広がることはありません）。
+
+---
+
+## 主なファイル
+
+| ファイル | 中身 |
+| --- | --- |
+| `src/App.jsx` | 画面のほぼすべて（児童・保護者・先生・管理者） |
+| `src/firebase.js` | Firebase への接続設定、エミュレータへの切り替え |
+| `functions/index.js` | 児童ログインの Cloud Functions（`ondokuStudentLogin`） |
+| `firestore.rules` | だれがどのデータを読み書きできるか |
+| `firebase.json` | デプロイ先（データベース・Hosting サイト・関数のグループ）とエミュレータの設定 |
